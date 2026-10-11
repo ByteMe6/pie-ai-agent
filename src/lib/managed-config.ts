@@ -8,5 +8,5 @@ export const ACCOUNT_BASE = STAGING
   ? "https://account-staging-ca69.up.railway.app"
   : "https://account.pie.chat";
 export const GATEWAY_BASE = STAGING
-  ? "https://litellm-staging-f897.up.railway.app"
+  ? "https://gateway-staging-15cf.up.railway.app"
   : "https://api.pie.chat";
