@@ -92,7 +92,10 @@ import {
   setSessionAgent,
   isSkillApprovedInSession,
   recordSkillApproval,
+  isMcpServerApprovedInSession,
+  recordMcpServerApproval,
 } from "../sessions/storage";
+import { prepareMcpForTask } from "../mcp/agent";
 import { addPinToMeta, removePinFromMeta } from "../sessions/pin-state";
 import { drainPending } from "../sessions/pending-instructions";
 import { buildMidTaskUserMessage } from "./loop-drain";
@@ -859,6 +862,7 @@ export function mergeSessionAgentSnapshot(
       ...snapshot,
       pendingInstructions: existing.pendingInstructions,
       ...(existing.approvedSkillIds ? { approvedSkillIds: existing.approvedSkillIds } : {}),
+      ...(existing.approvedMcpServerIds ? { approvedMcpServerIds: existing.approvedMcpServerIds } : {}),
     };
   }
   return { ...existing, ...snapshot };
@@ -1248,11 +1252,13 @@ export function collectCrossSessionConflicts(
   args: Record<string, unknown>,
   _pinnedTabId: number,
   crossSessionPinnedTabIds: ReadonlySet<number> | undefined,
+  /** Tool.toolClass for runtime tools (MCP); falls back to the static registry. */
+  toolClass?: "read" | "write",
 ): number[] {
   if (!crossSessionPinnedTabIds || crossSessionPinnedTabIds.size === 0) {
     return [];
   }
-  if (getToolClass(toolName) !== "write") return [];
+  if ((toolClass ?? getToolClass(toolName)) !== "write") return [];
 
   const conflicts: number[] = [];
   if (Array.isArray(args.tabIds)) {
@@ -1575,6 +1581,17 @@ export async function runAgentLoop(ctx: AgentLoopContext): Promise<void> {
   // arm the `schedule` group in headless runs (recursive-scheduling guard).
   const isHeadless = !ctx.resumedAgentMessages && !(ctx.messages && ctx.messages.length > 0);
 
+  // MCP servers — snapshot the enabled servers once per task: each becomes an
+  // on-demand `mcp:<slug>` group (catalog line in the system prompt, armed via
+  // load_tools). Tools are assembled per iteration only for loaded groups.
+  const mcp = await prepareMcpForTask({
+    vision: modelConfig.vision === true,
+    signal,
+    isApproved: (serverId) => isMcpServerApprovedInSession(sessionId, serverId),
+    requestConsent: (req) => requestFromPanel(sessionId, "mcp-tool-consent", req),
+    recordApproval: (serverId) => recordMcpServerApproval(sessionId, serverId),
+  });
+
   const systemMsg: AgentMessage = {
     role: "system",
     content: buildAgentSystemPrompt(
@@ -1604,6 +1621,8 @@ export async function runAgentLoop(ctx: AgentLoopContext): Promise<void> {
       // #344 — user custom-rules snapshot (see above). Rendered as a trusted
       // user-preference block after response_language when non-empty.
       customRules,
+      // MCP — one catalog line per enabled server (snapshotted above).
+      mcp.catalogLines,
     ),
   };
 
@@ -2079,6 +2098,7 @@ export async function runAgentLoop(ctx: AgentLoopContext): Promise<void> {
       const loadToolsTool = buildLoadToolsTool({
         getActiveGroups: () => activeToolGroups,
         headless: isHeadless,
+        extraGroups: mcp.extraGroups,
       });
       // run_skill_script 需要 sessionId（运行确认卡走 panel-request）——
       // 与 mouse/keyboard 同模式 per-run 装配，不进 BUILT_IN_TOOLS 静态表。
@@ -2171,6 +2191,8 @@ export async function runAgentLoop(ctx: AgentLoopContext): Promise<void> {
         readSkillOutputTool,
         loadToolsTool,
         ...localBridgeTools, // Slice 0 — run_local_agent (bridge-gated)
+        // MCP — only servers whose `mcp:<slug>` group is loaded contribute tools.
+        ...(await mcp.toolsForActiveGroups(activeToolGroups)),
       ];
       const disclosed = selectTools(fullToolList, activeToolGroups);
       const allToolsBeforeExclude = filterToolsByVision(disclosed, modelConfig.vision);
@@ -2665,6 +2687,7 @@ export async function runAgentLoop(ctx: AgentLoopContext): Promise<void> {
           args,
           pinnedTabId,
           crossSessionPinnedTabIds,
+          tool.toolClass,
         );
         if (r7Conflicts.length > 0) {
           // Drop the "or wait for it to finish" suggestion — even with the

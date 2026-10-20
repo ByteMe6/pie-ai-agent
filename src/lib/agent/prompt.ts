@@ -408,6 +408,9 @@ When the user asks you to run something on their machine (call a local agent, ru
  *   task start (stable per task). Rendered as a trusted user-preference block
  *   right after the response-language block; empty/whitespace ⇒ omitted. Appended
  *   last in the parameter list to keep existing positional call sites unshifted.
+ * @param extraCatalogLines Catalog entries for runtime tool groups (one per
+ *   enabled MCP server), snapshotted at task start; appended to the
+ *   <available_tools_catalog> block.
  */
 export function buildAgentSystemPrompt(
   hasKeyboardTools = false,
@@ -419,6 +422,7 @@ export function buildAgentSystemPrompt(
   startActiveGroups: ReadonlySet<string> = new Set(["core"]),
   bridgeReady = true,
   customRules?: string,
+  extraCatalogLines: readonly string[] = [],
 ): string {
   const keyboardGuidance = hasKeyboardTools ? KEYBOARD_SIM_GUIDANCE : "";
   const editorGuidance = hasKeyboardTools ? EDITOR_TOOLS_GUIDANCE : "";
@@ -431,7 +435,7 @@ export function buildAgentSystemPrompt(
   const responseLanguageBlock = buildResponseLanguageBlock(responseLanguage);
   const customRulesBlock = buildCustomRulesBlock(customRules);
   const activeGuidance = buildActiveGuidanceBlock(startActiveGroups);
-  const catalogBlock = buildToolCatalogBlock(startActiveGroups);
+  const catalogBlock = buildToolCatalogBlock(startActiveGroups, extraCatalogLines);
   const pieLinkGuidance = buildPieLinkGuidanceBlock(bridgeReady);
   return (
     `${STATIC_AGENT_SYSTEM_PROMPT}${READ_PAGE_GUIDANCE}${FRAME_AWARENESS_GUIDANCE}${keyboardGuidance}${editorGuidance}${skillCatalogBlock}${tabGuidance}${SEARCH_TOOL_GUIDANCE}${pinnedContext}${responseLanguageBlock}${customRulesBlock}${activeGuidance}${catalogBlock}${pieLinkGuidance}\n\n${R15_IMAGE_UNTRUSTED}`
