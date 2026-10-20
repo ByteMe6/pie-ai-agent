@@ -1,6 +1,11 @@
 import { resizeSW } from "@/lib/images/resize-sw";
 import type { ImageAttachment } from "@/lib/images";
 import type { CdpSession } from "@/background/cdp-session";
+import {
+  invalidateScreenshotGeometry,
+  probeViewport,
+  recordScreenshotGeometry,
+} from "../screenshot-geometry";
 
 export type CaptureOutcome =
   | { ok: true; value: ImageAttachment }
@@ -63,6 +68,20 @@ export async function dispatchCaptureVisibleTab(
   const resized = await resizeSW(blob);
   if (!resized.ok) return { ok: false, reason: resized.reason };
 
+  // click_at maps screenshot px → viewport CSS px against this record. A probe
+  // failure leaves no geometry, so click_at refuses instead of guessing.
+  const viewport = await probeViewport(ctx.pinnedTabId);
+  if (viewport) {
+    recordScreenshotGeometry(ctx.sessionId, ctx.pinnedTabId, {
+      ...viewport,
+      imageWidth: resized.value.width,
+      imageHeight: resized.value.height,
+      capturedAt: Date.now(),
+    });
+  } else {
+    invalidateScreenshotGeometry(ctx.sessionId, ctx.pinnedTabId);
+  }
+
   const id = `img_screenshot_${crypto.randomUUID()}`;
   return {
     ok: true,
@@ -119,6 +138,9 @@ export async function dispatchCaptureFullPageTab(
   ctx: CaptureContext,
   cdp: CdpAcquirer,
 ): Promise<CaptureOutcome> {
+  // Full-page images are in page coordinates, not viewport ones — the latest
+  // screenshot is no longer one click_at can map from.
+  invalidateScreenshotGeometry(ctx.sessionId, ctx.pinnedTabId);
   let session: CdpSession;
   try {
     session = await cdp.acquireSession({
