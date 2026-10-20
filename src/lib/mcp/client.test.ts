@@ -221,3 +221,12 @@ describe("McpClient — close", () => {
     expect(del?.headers["Mcp-Session-Id"]).toBe("s9");
   });
 });
+
+describe("McpClient — 403 body surfaced", () => {
+  it("Origin rejection text reaches the error message", async () => {
+    const fetchImpl = vi.fn(async () => new Response('{"error":"Origin not allowed"}', { status: 403 })) as unknown as typeof fetch;
+    const err = await new McpClient({ url: "http://x/mcp", fetchImpl }).initialize().catch((e) => e);
+    expect(err).toMatchObject({ kind: "auth", status: 403 });
+    expect(err.message).toContain("Origin not allowed");
+  });
+});

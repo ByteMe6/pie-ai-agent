@@ -274,9 +274,13 @@ export class McpClient {
 
       const sessionId = res.headers.get("mcp-session-id") ?? undefined;
       if (res.status === 401 || res.status === 403) {
+        // 403 is also how servers reject a disallowed Origin (DNS-rebinding
+        // protection) — surface the body so "Origin not allowed" is visible.
+        const text = await safeText(res);
         throw new McpError(
           "auth",
-          `${body.method}: HTTP ${res.status} — the server rejected our credentials. Check the Authorization header in Settings → MCP servers.`,
+          `${body.method}: HTTP ${res.status}${text ? ` — ${text.slice(0, 300)}` : ""}. ` +
+            `Check the Authorization header in Settings → MCP servers, or allow this extension's origin on the server.`,
           res.status,
         );
       }
