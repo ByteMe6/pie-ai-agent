@@ -47,6 +47,7 @@ import type { RoleViolation } from "@/lib/agent/history-validation";
 import { logHistoryRepaired } from "@/lib/agent/history-validation-telemetry";
 import {
   setSessionAgent,
+  updateSessionAgent,
   setPendingConfirm,
   getSessionAgent,
   getSessionMeta,
@@ -1367,9 +1368,10 @@ function makeStepSnapshotHandler(sessionId: string) {
     // lands AFTER setPendingConfirm. Previous behavior was correct only by
     // luck (the loop is suspended during user-confirm wait so no snapshot
     // fired); the merge makes the invariant explicit.
-    const existing = await getSessionAgent(sessionId);
-    const merged = mergeSessionAgentSnapshot(existing, snapshot);
-    await setSessionAgent(sessionId, merged);
+    // Atomic read-merge-write: a plain get → set here raced with the mid-task
+    // instruction queue (addPending) and wrote back a stale queue, dropping
+    // messages the user sent while the agent was working.
+    await updateSessionAgent(sessionId, (existing) => mergeSessionAgentSnapshot(existing, snapshot));
     if (snapshot.stepIndex % 5 === 0) {
       updateLastAccessed(sessionId).catch((e) => {
         console.warn(

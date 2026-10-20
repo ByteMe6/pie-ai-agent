@@ -94,7 +94,7 @@ import {
   recordSkillApproval,
 } from "../sessions/storage";
 import { addPinToMeta, removePinFromMeta } from "../sessions/pin-state";
-import { drainPending } from "../sessions/pending-instructions";
+import { drainPending, hasPending } from "../sessions/pending-instructions";
 import { buildMidTaskUserMessage } from "./loop-drain";
 import { broadcastInstructionState } from "@/background/instruction-broadcast";
 import {
@@ -2552,6 +2552,20 @@ export async function runAgentLoop(ctx: AgentLoopContext): Promise<void> {
             }
           }
         }
+        // Issue #34 follow-up — the user queued an instruction while this final
+        // reply was streaming. Ending here would strand it in the queue until
+        // they send yet another message. Keep the reply in history and loop:
+        // the top-of-loop drain delivers the queued message as the next turn.
+        if (!signal.aborted && (await hasPending(sessionId))) {
+          if (!hasRemoteTools) {
+            const replyBlocks = assembleAssistantBlocks(thinkingBlocks, accumulatedText, turnBlocks);
+            if (replyBlocks.length > 0) history.push({ role: "assistant", content: replyBlocks });
+          }
+          // The panel keeps accumulating streamed text until chat-done; keep the
+          // next answer from running into this one.
+          if (accumulatedText.trim()) emit(withSession({ type: "chat-chunk", text: "\n\n" }, sessionId));
+          continue;
+        }
         if (ctx.onTaskDone) {
           try {
             await ctx.onTaskDone();
@@ -2994,7 +3008,12 @@ export async function runAgentLoop(ctx: AgentLoopContext): Promise<void> {
         });
       }
 
-      // Terminal tool check
+      // Terminal tool check. Issue #34 follow-up — a queued instruction
+      // overrides done/fail: the tool_result is already in history, and the
+      // top-of-loop drain hands the model the user's new message next turn.
+      if (shouldTerminate && terminationResult && !signal.aborted && (await hasPending(sessionId))) {
+        continue;
+      }
       if (shouldTerminate && terminationResult) {
         await emitDone({
           type: "agent-done-task",

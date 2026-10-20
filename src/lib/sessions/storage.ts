@@ -463,6 +463,38 @@ export async function setSessionAgent(
   await writeAtomic({ [agentKey(id)]: state });
 }
 
+/** Minimal agent record for writers that land before the first step snapshot. */
+export function emptySessionAgentState(): SessionAgentState {
+  return { agentMessages: [], pendingInstructions: [], stepIndex: 0, hasImageContent: false };
+}
+
+/**
+ * Atomic read-modify-write of a session's agent record in ONE IDB readwrite
+ * transaction — the agent-record twin of `updateSessionMeta`.
+ *
+ * The agent record has several concurrent writers: the SW step-snapshot
+ * handler (every step), the mid-task instruction queue (panel-triggered
+ * add / cancel, loop drain) and per-session approvals. With the old
+ * getSessionAgent → setSessionAgent pattern two writers could interleave and
+ * the later write clobber the earlier one — e.g. a step snapshot written back
+ * over a just-queued instruction, silently dropping the user's message.
+ *
+ * `transform` receives the latest committed record (null when none exists)
+ * and MUST be synchronous. Return the next record, or null / the same
+ * reference to skip the write. Returns true when a write was committed.
+ */
+export async function updateSessionAgent(
+  id: string,
+  transform: (current: SessionAgentState | null) => SessionAgentState | null,
+): Promise<boolean> {
+  return updateSessionRecordWithIndex(agentKey(id), (raw) => {
+    const current = (raw ?? null) as SessionAgentState | null;
+    const next = transform(current);
+    if (next === null || next === current) return null;
+    return { record: next };
+  });
+}
+
 /**
  * ADR 0007 — has the user approved running scripts for `skillId` in this
  * session? Reads the persisted per-session approval set (survives SW death).
@@ -480,16 +512,11 @@ export async function isSkillApprovedInSession(id: string, skillId: string): Pro
  * approval; the next step-end snapshot merges it forward (spread-existing-first).
  */
 export async function recordSkillApproval(id: string, skillId: string): Promise<void> {
-  const agent = await getSessionAgent(id);
-  const existing = agent?.approvedSkillIds ?? [];
-  if (existing.includes(skillId)) return;
-  const approvedSkillIds = [...existing, skillId];
-  await setSessionAgent(
-    id,
-    agent
-      ? { ...agent, approvedSkillIds }
-      : { agentMessages: [], pendingInstructions: [], stepIndex: 0, hasImageContent: false, approvedSkillIds },
-  );
+  await updateSessionAgent(id, (agent) => {
+    const existing = agent?.approvedSkillIds ?? [];
+    if (existing.includes(skillId)) return null;
+    return { ...(agent ?? emptySessionAgentState()), approvedSkillIds: [...existing, skillId] };
+  });
 }
 
 /**
