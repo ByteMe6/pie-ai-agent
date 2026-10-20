@@ -1704,6 +1704,12 @@ export async function runAgentLoop(ctx: AgentLoopContext): Promise<void> {
     // abort exits this loop. The soft checkpoint (SOFT_STEP_BUDGET) is a
     // neutral periodic self-check, not a wrap-up signal; there is no absolute
     // step ceiling by design.
+    // Free/early-access endpoints (NVIDIA NIM, Gemini compat) intermittently
+    // answer 200 with nothing in it. One flaky step used to fail the whole
+    // task; re-ask the same step a couple of times first. Nothing is appended
+    // to history on an empty completion, so the retry is an exact replay.
+    let emptyRetries = 0;
+    const MAX_EMPTY_RETRIES = 2;
     for (let stepIndex = startStepIndex; !signal.aborted; stepIndex++) {
       lastStepIndex = stepIndex;
       if (signal.aborted) return; // → finally
@@ -2468,6 +2474,13 @@ export async function runAgentLoop(ctx: AgentLoopContext): Promise<void> {
         }, "fail");
         return;
       }
+      if (completion === "empty" && emptyRetries < MAX_EMPTY_RETRIES && !signal.aborted) {
+        emptyRetries++;
+        console.warn(`[loop] empty completion — retry ${emptyRetries}/${MAX_EMPTY_RETRIES}`);
+        await emptyRetryDelay(1500 * emptyRetries, signal);
+        continue;
+      }
+      if (completion !== "empty") emptyRetries = 0;
       if (completion === "empty") {
         // 空完成：无 tool call、无任何文本产出（stopReason 非 length）。通常是上游/
         // 中转在扣费后失败（#413），却被静默当成一次空回复然后结束任务——不走
@@ -3042,4 +3055,15 @@ export async function runAgentLoop(ctx: AgentLoopContext): Promise<void> {
       }, "abort");
     }
   }
+}
+
+
+/** Abortable pause before replaying an empty completion (skipped under unit tests). */
+async function emptyRetryDelay(ms: number, signal: AbortSignal): Promise<void> {
+  if (typeof process !== "undefined" && process.env?.VITEST) return;
+  await new Promise<void>((resolve) => {
+    if (signal.aborted) return resolve();
+    const t = setTimeout(resolve, ms);
+    signal.addEventListener("abort", () => { clearTimeout(t); resolve(); }, { once: true });
+  });
 }

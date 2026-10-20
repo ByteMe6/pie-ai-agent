@@ -468,3 +468,44 @@ describe("ratelimit-wait 转发（RPM 限流）", () => {
     expect(rl!.sessionId).toBe("s-rl");
   });
 });
+
+describe("empty completion retry", () => {
+  beforeEach(() => { vi.clearAllMocks(); });
+
+  const ctx = (emit: AgentEmit) => ({
+    emit,
+    task: "Say hello",
+    modelConfig: { provider: "openai", model: "gpt-4o", apiKey: "sk-test", vision: false },
+    signal: new AbortController().signal,
+    sessionId: "s-empty",
+    pinnedTabs: [{ tabId: 1, origin: "https://example.com" }],
+    initialFocusTabId: 1,
+  });
+
+  it("replays the step after empty completions and then finishes normally", async () => {
+    const { runAgentLoop } = await import("./loop");
+    const { classifyStreamCompletion } = await import("./stream-completion");
+    const { streamChat } = await import("../model-router");
+    vi.mocked(classifyStreamCompletion)
+      .mockReturnValueOnce("empty")
+      .mockReturnValueOnce("empty")
+      .mockReturnValue("ok");
+    const emitted: { type: string }[] = [];
+    await runAgentLoop(ctx((m) => { emitted.push(m as { type: string }); }) as any);
+    expect(vi.mocked(streamChat)).toHaveBeenCalledTimes(3);
+    expect(emitted.some((m) => m.type === "chat-error")).toBe(false);
+    expect(emitted.some((m) => m.type === "chat-done")).toBe(true);
+  });
+
+  it("gives up with chat-error after the retry budget", async () => {
+    const { runAgentLoop } = await import("./loop");
+    const { classifyStreamCompletion } = await import("./stream-completion");
+    const { streamChat } = await import("../model-router");
+    vi.mocked(classifyStreamCompletion).mockReturnValue("empty");
+    const emitted: { type: string; error?: string }[] = [];
+    await runAgentLoop(ctx((m) => { emitted.push(m as { type: string }); }) as any);
+    expect(vi.mocked(streamChat)).toHaveBeenCalledTimes(3);
+    expect(emitted.find((m) => m.type === "chat-error")?.error).toMatch(/empty response/);
+    vi.mocked(classifyStreamCompletion).mockReturnValue("ok");
+  });
+});
