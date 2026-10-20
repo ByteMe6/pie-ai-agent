@@ -114,3 +114,24 @@ describe("disclosure plumbing for runtime groups", () => {
     expect(prompt).toContain(line);
   });
 });
+
+describe("system prompt MCP block", () => {
+  it("explicitly steers to load the server instead of operating the page", async () => {
+    const { buildMcpServersBlock } = await import("../agent/prompt");
+    expect(buildMcpServersBlock([])).toBe("");
+    const block = buildMcpServersBlock(['mcp:google_docs — external MCP server "Google Docs" — 19 tools: get_doc_content']);
+    expect(block).toContain("<external_mcp_servers>");
+    expect(block).toContain('load_tools({groups:["mcp:…"]})');
+    expect(block).toContain("docs.google.com");
+    expect(block).toContain("- mcp:google_docs");
+    expect(block.trim().endsWith("</external_mcp_servers>")).toBe(true);
+  });
+
+  it("servers no longer hide in the generic catalog", () => {
+    const line = 'mcp:docs — external MCP server "Docs"';
+    const prompt = buildAgentSystemPrompt(true, true, [], undefined, [], undefined, new Set(["core"]), true, undefined, [line]);
+    const mcpBlock = prompt.slice(prompt.indexOf("<external_mcp_servers>"));
+    expect(mcpBlock).toContain(line);
+    expect(prompt.indexOf(line)).toBe(prompt.lastIndexOf(line)); // listed once
+  });
+});

@@ -1581,16 +1581,20 @@ export async function runAgentLoop(ctx: AgentLoopContext): Promise<void> {
   // arm the `schedule` group in headless runs (recursive-scheduling guard).
   const isHeadless = !ctx.resumedAgentMessages && !(ctx.messages && ctx.messages.length > 0);
 
-  // MCP servers — snapshot the enabled servers once per task: each becomes an
-  // on-demand `mcp:<slug>` group (catalog line in the system prompt, armed via
-  // load_tools). Tools are assembled per iteration only for loaded groups.
-  const mcp = await prepareMcpForTask({
-    vision: modelConfig.vision === true,
-    signal,
-    isApproved: (serverId) => isMcpServerApprovedInSession(sessionId, serverId),
-    requestConsent: (req) => requestFromPanel(sessionId, "mcp-tool-consent", req),
-    recordApproval: (serverId) => recordMcpServerApproval(sessionId, serverId),
-  });
+  // MCP servers — each enabled server is an on-demand `mcp:<slug>` group, armed
+  // via load_tools. The system prompt lists the servers enabled at task start
+  // (stable prompt for caching); load_tools + tool assembly re-read the server
+  // list every iteration, so a server added / enabled mid-task (e.g. right after
+  // the user says "use my MCP") is loadable on the next step.
+  const prepareMcp = () =>
+    prepareMcpForTask({
+      vision: modelConfig.vision === true,
+      signal,
+      isApproved: (serverId) => isMcpServerApprovedInSession(sessionId, serverId),
+      requestConsent: (req) => requestFromPanel(sessionId, "mcp-tool-consent", req),
+      recordApproval: (serverId) => recordMcpServerApproval(sessionId, serverId),
+    });
+  const mcpAtStart = await prepareMcp();
 
   const systemMsg: AgentMessage = {
     role: "system",
@@ -1622,7 +1626,7 @@ export async function runAgentLoop(ctx: AgentLoopContext): Promise<void> {
       // user-preference block after response_language when non-empty.
       customRules,
       // MCP — one catalog line per enabled server (snapshotted above).
-      mcp.catalogLines,
+      mcpAtStart.catalogLines,
     ),
   };
 
@@ -2095,6 +2099,7 @@ export async function runAgentLoop(ctx: AgentLoopContext): Promise<void> {
       // since the seed already contains every group). `filterToolsByVision` runs
       // AFTER selectTools as fail-closed defense — screenshot tools never reach a
       // non-vision model even if the `screenshot` group is somehow active.
+      const mcp = await prepareMcp();
       const loadToolsTool = buildLoadToolsTool({
         getActiveGroups: () => activeToolGroups,
         headless: isHeadless,
