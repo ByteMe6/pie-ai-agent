@@ -139,15 +139,15 @@ export async function reclaimLateInstructions(
  * The task's emit wrapper. A task's final answer closes the queue; anything
  * still in it at that moment is handed back to the panel.
  *
- * The task's generation is captured when the wrapper is created (i.e. when the
- * task starts), so a superseded task's late terminal emit cannot close the
- * queue of the task that replaced it.
+ * The task's generation is passed in (taken when the task was dispatched), so
+ * a superseded task's late terminal emit cannot close the queue of the task
+ * that replaced it.
  */
 export function makeGuardedTaskEmit(
   deps: TaskEndGuardDeps,
   sessionId: string,
+  generation: number,
 ): (m: PortMessageToPanel) => void {
-  const generation = currentGeneration(sessionId);
   return (m) => {
     deps.post(m);
     if (m.type !== "chat-done" && m.type !== "agent-done-task") return;

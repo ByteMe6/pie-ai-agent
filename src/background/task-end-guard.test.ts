@@ -58,7 +58,8 @@ describe("session end state", () => {
 describe("makeGuardedTaskEmit", () => {
   it("forwards every message to the panel", () => {
     const { posted, deps } = makeDeps();
-    const emit = makeGuardedTaskEmit(deps, SESSION_ID);
+    const gen = beginTask(SESSION_ID);
+    const emit = makeGuardedTaskEmit(deps, SESSION_ID, gen);
     emit({ type: "chat-chunk", text: "hi", sessionId: SESSION_ID });
     expect(posted.map((m) => m.type)).toEqual(["chat-chunk"]);
     // A chunk is not a terminal message — the queue stays open.
@@ -67,7 +68,8 @@ describe("makeGuardedTaskEmit", () => {
 
   it("closes the queue on chat-done", () => {
     const { posted, deps } = makeDeps();
-    const emit = makeGuardedTaskEmit(deps, SESSION_ID);
+    const gen = beginTask(SESSION_ID);
+    const emit = makeGuardedTaskEmit(deps, SESSION_ID, gen);
     emit({ type: "chat-done", sessionId: SESSION_ID });
     expect(isSessionEnded(SESSION_ID)).toBe(true);
     expect(posted.map((m) => m.type)).toEqual(["chat-done"]);
@@ -75,7 +77,8 @@ describe("makeGuardedTaskEmit", () => {
 
   it("closes the queue on agent-done-task", () => {
     const { deps } = makeDeps();
-    const emit = makeGuardedTaskEmit(deps, SESSION_ID);
+    const gen = beginTask(SESSION_ID);
+    const emit = makeGuardedTaskEmit(deps, SESSION_ID, gen);
     emit({
       type: "agent-done-task",
       success: true,
@@ -89,7 +92,8 @@ describe("makeGuardedTaskEmit", () => {
   it("reclaims an instruction that raced past the loop's last queue check", async () => {
     const queue = [instr("late-1")];
     const { posted, deps } = makeDeps(queue);
-    const emit = makeGuardedTaskEmit(deps, SESSION_ID);
+    const gen = beginTask(SESSION_ID);
+    const emit = makeGuardedTaskEmit(deps, SESSION_ID, gen);
 
     // The instruction is queued AFTER the loop's final check but BEFORE the
     // final emit.
@@ -109,7 +113,8 @@ describe("makeGuardedTaskEmit", () => {
   it("posts ONE rejection when several instructions raced in", async () => {
     const queue = [instr("late-1"), instr("late-2"), instr("late-3")];
     const { posted, deps } = makeDeps(queue);
-    const emit = makeGuardedTaskEmit(deps, SESSION_ID);
+    const gen = beginTask(SESSION_ID);
+    const emit = makeGuardedTaskEmit(deps, SESSION_ID, gen);
 
     emit({ type: "chat-done", sessionId: SESSION_ID });
     await vi.waitFor(() => expect(posted).toHaveLength(2));
@@ -122,7 +127,8 @@ describe("makeGuardedTaskEmit", () => {
 
   it("posts no rejection when the queue was already drained", async () => {
     const { posted, deps } = makeDeps([]);
-    const emit = makeGuardedTaskEmit(deps, SESSION_ID);
+    const gen = beginTask(SESSION_ID);
+    const emit = makeGuardedTaskEmit(deps, SESSION_ID, gen);
     emit({ type: "chat-done", sessionId: SESSION_ID });
     await new Promise((r) => setTimeout(r, 5));
     expect(posted.map((m) => m.type)).toEqual(["chat-done"]);
@@ -162,12 +168,12 @@ describe("task generations", () => {
     const { posted, deps } = makeDeps(queue);
 
     // Task A starts…
-    beginTask(SESSION_ID);
-    const emitA = makeGuardedTaskEmit(deps, SESSION_ID);
+    const genA = beginTask(SESSION_ID);
+    const emitA = makeGuardedTaskEmit(deps, SESSION_ID, genA);
 
     // …the panel starts task B before A winds down.
-    beginTask(SESSION_ID);
-    const emitB = makeGuardedTaskEmit(deps, SESSION_ID);
+    const genB = beginTask(SESSION_ID);
+    const emitB = makeGuardedTaskEmit(deps, SESSION_ID, genB);
 
     // A's late terminal emit (the abort path emits from the loop's finally,
     // after the new task already started) must not touch B's queue.
@@ -191,5 +197,26 @@ describe("task generations", () => {
     await new Promise((r) => setTimeout(r, 5));
     expect(isSessionEnded(SESSION_ID)).toBe(false);
     expect(posted).toHaveLength(0);
+  });
+
+  it("a task whose dispatch generation is stale cannot close the new task's queue", async () => {
+    const queue = [instr("for-the-new-task")];
+    const { posted, deps } = makeDeps(queue);
+
+    // Task A is dispatched (generation 1)…
+    const genA = beginTask(SESSION_ID);
+    // …but before A's loop actually starts, task B is dispatched (generation 2).
+    const genB = beginTask(SESSION_ID);
+    // A's emit wrapper is built with A's generation, not the current one.
+    const emitA = makeGuardedTaskEmit(deps, SESSION_ID, genA);
+    const emitB = makeGuardedTaskEmit(deps, SESSION_ID, genB);
+
+    emitA({ type: "agent-done-task", success: false, summary: "aborted", stepCount: 1, sessionId: SESSION_ID });
+    await new Promise((r) => setTimeout(r, 5));
+
+    expect(genA).not.toBe(genB);
+    expect(isSessionEnded(SESSION_ID)).toBe(false);
+    expect(queue).toHaveLength(1);
+    expect(posted.filter((m) => m.type === "chat-instruction-rejected")).toHaveLength(0);
   });
 });

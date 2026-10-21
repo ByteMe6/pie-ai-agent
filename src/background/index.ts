@@ -1111,6 +1111,7 @@ async function handleResumeRequest(
   abortController: AbortController,
   inFlightSessionIds: Set<string>,
   keepAlive: KeepAlive,
+  taskGeneration: number,
 ): Promise<void> {
   try {
     const signal = abortController.signal;
@@ -1228,7 +1229,7 @@ async function handleResumeRequest(
   }
 
   await runAgentLoop({
-    emit: makeTaskEmit(port, sessionId),
+    emit: makeTaskEmit(port, sessionId, taskGeneration),
     task: taskForPrompt,
     modelConfig,
     instanceId: resumeSel.instanceId,
@@ -1408,15 +1409,20 @@ function makeStepSnapshotHandler(sessionId: string) {
  * final queue check and this emit — would sit in the queue forever: the user
  * sees it as sent, the agent never answers it.
  *
- * The SW arbitrates that window — see `task-end-guard.ts`.
+ * The SW arbitrates that window — see `task-end-guard.ts`. The task's
+ * generation is passed in (taken when the task was dispatched) so a
+ * superseded task's late terminal emit cannot close the queue of the task
+ * that replaced it.
  */
 function makeTaskEmit(
   port: chrome.runtime.Port,
   sessionId: string,
+  taskGeneration: number,
 ): (m: PortMessageToPanel) => void {
   return makeGuardedTaskEmit(
     { post: (m) => port.postMessage(m), drainPending },
     sessionId,
+    taskGeneration,
   );
 }
 
@@ -1427,6 +1433,7 @@ async function handleChatStream(
   abortController: AbortController,
   inFlightSessionIds: Set<string>,
   keepAlive: KeepAlive,
+  taskGeneration: number,
   fallbackTitle?: string,
 ) {
   const signal = abortController.signal;
@@ -1659,7 +1666,7 @@ async function handleChatStream(
         : ("auto" as const);
 
     await runAgentLoop({
-      emit: makeTaskEmit(port, sessionId),
+      emit: makeTaskEmit(port, sessionId, taskGeneration),
       task,
       modelConfig,
       instanceId: chatSel.instanceId,
@@ -1813,8 +1820,10 @@ chrome.runtime.onConnect.addListener((port) => {
       rotateAbortController(abortRotation, () => {});
       inFlightSessionIds.add(message.sessionId);
       runningSessionIds.add(message.sessionId);
-      // A new task reopens the instruction queue.
-      beginTask(message.sessionId);
+      // A new task reopens the instruction queue. The generation identifies
+      // THIS task: a superseded task's late terminal emit must not close the
+      // queue of the task that replaced it.
+      const taskGeneration = beginTask(message.sessionId);
       keepAlive.ensure();
       handleChatStream(
         port,
@@ -1823,6 +1832,7 @@ chrome.runtime.onConnect.addListener((port) => {
         abortRotation.current,
         inFlightSessionIds,
         keepAlive,
+        taskGeneration,
         message.fallbackTitle,
       );
     } else if (message.type === "chat-abort") {
@@ -1915,8 +1925,8 @@ chrome.runtime.onConnect.addListener((port) => {
       rotateAbortController(abortRotation, () => {});
       inFlightSessionIds.add(message.sessionId);
       runningSessionIds.add(message.sessionId);
-      // A resumed task reopens the instruction queue.
-      beginTask(message.sessionId);
+      // A resumed task reopens the instruction queue (see chat-start).
+      const taskGeneration = beginTask(message.sessionId);
       keepAlive.ensure();
       handleResumeRequest(
         port,
@@ -1924,6 +1934,7 @@ chrome.runtime.onConnect.addListener((port) => {
         abortRotation.current,
         inFlightSessionIds,
         keepAlive,
+        taskGeneration,
       ).catch((e) => {
         console.warn(
           `[sw] resume-task handler failed for session=${message.sessionId}:`,
