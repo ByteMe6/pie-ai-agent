@@ -9,7 +9,7 @@ import type { Tool, ToolHandlerContext } from "../agent/types";
 import type { ActionResult } from "../dom-actions/types";
 import { escapeUntrustedWrappers, escapeWrapperAttribute } from "../agent/untrusted-wrappers";
 import { resizeSW } from "../images/resize-sw";
-import { McpClient, McpError, type McpCallToolResult, type McpToolDef } from "./client";
+import { McpClient, type McpCallToolResult, type McpToolDef } from "./client";
 import { exposeToolNames, mcpGroupId } from "./names";
 import { sanitizeInputSchema } from "./schema";
 import type { McpToolSummary, StoredMcpServer } from "./store";
@@ -261,7 +261,7 @@ export function buildMcpTools(
         const result = await client.callTool(def.name, callArgs, ctx.signal ?? deps.signal);
         return await convertCallResult(result, { serverName: server.name, toolName: def.name, vision: deps.vision });
       } catch (e) {
-        return { success: false, error: describeMcpFailure(server, e) };
+        return { success: false, error: describeMcpFailure(server, e, def.name) };
       }
     },
   }));
@@ -282,11 +282,32 @@ function previewArgs(args: Record<string, unknown>): string {
   return s.length > 2_000 ? `${s.slice(0, 2_000)}…` : s;
 }
 
-export function describeMcpFailure(server: StoredMcpServer, e: unknown): string {
-  if (e instanceof McpError) {
-    return `MCP server "${server.name}" (${server.url}): ${e.message}`;
+/**
+ * LLM-facing failure text. Two hazards in the raw error: (1) it embeds
+ * server-controlled text (HTTP error body, JSON-RPC error.message) — that is
+ * third-party data and must sit inside <untrusted_mcp_output> like any result;
+ * (2) it embeds the configured server URL, which for many hosted servers
+ * carries the credential in its path or query (`/mcp/<token>`, `?api_key=`) —
+ * only the origin is shown to the model.
+ */
+export function describeMcpFailure(server: StoredMcpServer, e: unknown, toolName = ""): string {
+  const shownUrl = redactServerUrl(server.url);
+  const raw = e instanceof Error ? e.message : String(e);
+  const msg = server.url ? raw.split(server.url).join(shownUrl) : raw;
+  return (
+    `MCP server "${server.name}" (${shownUrl}) failed:\n` +
+    wrapMcpOutput(msg, server.name, toolName)
+  );
+}
+
+/** Origin only — path / query / userinfo of a server URL may hold a secret. */
+export function redactServerUrl(url: string): string {
+  try {
+    const u = new URL(url);
+    return u.pathname === "/" && !u.search ? u.origin : `${u.origin}/…`;
+  } catch {
+    return "(invalid URL)";
   }
-  return `MCP server "${server.name}": ${e instanceof Error ? e.message : String(e)}`;
 }
 
 // ── Disclosure groups ────────────────────────────────────────────────────────
