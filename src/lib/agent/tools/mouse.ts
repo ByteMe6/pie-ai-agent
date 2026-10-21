@@ -313,13 +313,15 @@ Google Docs: prefer placing the caret by text (see press_key) over pixels; pixel
         return { success: false, error: `button must be one of ${MOUSE_BUTTONS.join(", ")} (got ${String(a.button)}).` };
       }
 
-      const mapped = mapScreenshotPoint(
+      // Cheap pre-check so a doomed click never prompts for CDP consent or
+      // attaches the debugger. NOT authoritative — see the re-check below.
+      const precheck = mapScreenshotPoint(
         getScreenshotGeometry(deps.sessionId, ctx.tabId),
         { x, y },
         await probeViewport(ctx.tabId),
         Date.now(),
       );
-      if (!mapped.ok) return { success: false, error: mapped.error };
+      if (!precheck.ok) return { success: false, error: precheck.error };
 
       const gate = await requireCdpInput({
         sessionId: deps.sessionId,
@@ -342,6 +344,17 @@ Google Docs: prefer placing the caret by text (see press_key) over pixels; pixel
       }
 
       try {
+        // Authoritative check, right before dispatch: the consent card can sit
+        // open for minutes (user may scroll / resize meanwhile), and the first
+        // debugger attach shows Chrome's "started debugging" infobar, which
+        // shrinks the viewport. Either makes the pre-check result stale.
+        const mapped = mapScreenshotPoint(
+          getScreenshotGeometry(deps.sessionId, ctx.tabId),
+          { x, y },
+          await probeViewport(ctx.tabId),
+          Date.now(),
+        );
+        if (!mapped.ok) return { success: false, error: mapped.error };
         return await withActionSettle(ctx.tabId, async () => {
           await dispatchMouseAt(session, mapped.x, mapped.y, "mouseMoved");
           // Chromium recognises double/triple clicks from a press/release run

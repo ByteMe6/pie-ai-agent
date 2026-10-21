@@ -534,6 +534,39 @@ describe("click_at tool", () => {
     expect(acquireSession).not.toHaveBeenCalled();
   });
 
+  it("page scrolled while the CDP consent card was open → stale error, no click", async () => {
+    await setCdpInputEnabled(false);
+    seedScreenshot();
+    const session = fakeSession();
+    // The user scrolls while deciding; consent resolves after the scroll.
+    const requestConsent = vi.fn(async () => {
+      mockProbe({ ...PROBE, scrollY: 400 });
+      return true;
+    });
+    const tool = buildClickAtTool(deps({ acquireSession: vi.fn().mockResolvedValue(session), requestConsent }));
+    const r = await tool.handler({ x: 10, y: 10 }, { tabId: 7 });
+    expect(requestConsent).toHaveBeenCalled();
+    expect(r.success).toBe(false);
+    expect(r.error).toContain("take capture_visible_tab again");
+    expect(vi.mocked(session.send)).not.toHaveBeenCalled();
+    expect(getScreenshotGeometry("S1", 7)).toBeUndefined();
+  });
+
+  it("viewport shrinks on debugger attach (infobar) → stale error, no click", async () => {
+    seedScreenshot();
+    const session = fakeSession();
+    const acquireSession = vi.fn(async () => {
+      mockProbe({ ...PROBE, cssHeight: 864 });
+      return session;
+    });
+    const tool = buildClickAtTool(deps({ acquireSession }));
+    const r = await tool.handler({ x: 10, y: 10 }, { tabId: 7 });
+    expect(acquireSession).toHaveBeenCalled();
+    expect(r.success).toBe(false);
+    expect(r.error).toMatch(/resized/);
+    expect(vi.mocked(session.send)).not.toHaveBeenCalled();
+  });
+
   it("out-of-bounds point → error", async () => {
     seedScreenshot();
     const tool = buildClickAtTool(deps());
