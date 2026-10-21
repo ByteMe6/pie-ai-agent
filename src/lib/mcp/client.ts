@@ -120,15 +120,22 @@ export class McpClient {
     this.fetchImpl = opts.fetchImpl ?? ((...a) => fetch(...a));
   }
 
-  /** Idempotent: concurrent callers share one handshake. */
+  /**
+   * Idempotent: concurrent callers share one handshake. The shared handshake
+   * is bounded only by the client timeout, never by a caller's signal — the
+   * pool shares one client across sessions, so session A's Stop must not fail
+   * session B's in-flight call that happens to be waiting on the same
+   * handshake. Each caller's own signal only abandons its own wait.
+   */
   initialize(signal?: AbortSignal): Promise<McpInitializeResult> {
     if (!this.initPromise) {
-      this.initPromise = this.handshake(signal).catch((e) => {
-        this.initPromise = undefined;
+      const p: Promise<McpInitializeResult> = this.handshake().catch((e) => {
+        if (this.initPromise === p) this.initPromise = undefined;
         throw e;
       });
+      this.initPromise = p;
     }
-    return this.initPromise;
+    return signal ? raceAbort(this.initPromise, signal) : this.initPromise;
   }
 
   async listTools(signal?: AbortSignal): Promise<McpToolDef[]> {
@@ -180,7 +187,7 @@ export class McpClient {
 
   // ── internals ──────────────────────────────────────────────────────────────
 
-  private async handshake(signal?: AbortSignal): Promise<McpInitializeResult> {
+  private async handshake(): Promise<McpInitializeResult> {
     this.sessionId = undefined;
     this.protocolVersion = undefined;
     const { message, sessionId } = await this.post(
@@ -194,7 +201,7 @@ export class McpClient {
           clientInfo: CLIENT_INFO,
         },
       },
-      signal,
+      undefined,
       /* expectResponse */ true,
     );
     const result = unwrap(message) as McpInitializeResult;
@@ -210,7 +217,7 @@ export class McpClient {
     }
     this.sessionId = sessionId;
     this.protocolVersion = result.protocolVersion;
-    await this.post({ jsonrpc: "2.0", method: "notifications/initialized" }, signal, false);
+    await this.post({ jsonrpc: "2.0", method: "notifications/initialized" }, undefined, false);
     return result;
   }
 
@@ -389,6 +396,24 @@ async function readSseResponse(res: Response, id: number): Promise<JsonRpcRespon
   } finally {
     reader.cancel().catch(() => {});
   }
+}
+
+function raceAbort<T>(p: Promise<T>, signal: AbortSignal): Promise<T> {
+  if (signal.aborted) return Promise.reject(new McpError("aborted", "initialize: aborted"));
+  return new Promise<T>((resolve, reject) => {
+    const onAbort = () => reject(new McpError("aborted", "initialize: aborted"));
+    signal.addEventListener("abort", onAbort, { once: true });
+    p.then(
+      (v) => {
+        signal.removeEventListener("abort", onAbort);
+        resolve(v);
+      },
+      (e) => {
+        signal.removeEventListener("abort", onAbort);
+        reject(e);
+      },
+    );
+  });
 }
 
 function withTimeout(

@@ -192,6 +192,27 @@ describe("McpClient — errors", () => {
     await expect(p).rejects.toMatchObject({ kind: "aborted" });
   });
 
+  it("one caller aborting does not fail another caller sharing the handshake", async () => {
+    let release!: () => void;
+    const gate = new Promise<void>((r) => (release = r));
+    const { fetchImpl } = fakeServer({
+      initialize: async (b, init) => {
+        await gate;
+        if (init.signal?.aborted) throw new DOMException("aborted", "AbortError");
+        return initOk("s1")(b, init);
+      },
+      "tools/list": (b) => json({ jsonrpc: "2.0", id: b.id, result: { tools: [{ name: "t" }] } }),
+    });
+    const c = new McpClient({ url: "http://x/mcp", fetchImpl });
+    const sessionA = new AbortController();
+    const a = c.listTools(sessionA.signal);
+    const b = c.listTools(new AbortController().signal);
+    sessionA.abort();
+    release();
+    await expect(a).rejects.toMatchObject({ kind: "aborted" });
+    await expect(b).resolves.toEqual([{ name: "t" }]);
+  });
+
   it("timeout → kind=timeout", async () => {
     const fetchImpl = vi.fn((_u: unknown, init?: RequestInit) =>
       new Promise<Response>((_res, rej) => {
