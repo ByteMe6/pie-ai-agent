@@ -131,6 +131,8 @@ vi.mock("../sessions/storage", () => ({
   setSessionMeta: vi.fn(async () => {}),
   getSessionAgent: vi.fn(async () => null),
   setSessionAgent: vi.fn(async () => {}),
+  // Single-transaction agent-record writer (used once PR #464 lands).
+  updateSessionAgent: vi.fn(async () => true),
 }));
 vi.mock("../sessions/pin-state", () => ({
   addPinToMeta: vi.fn(async () => {}),
@@ -138,6 +140,8 @@ vi.mock("../sessions/pin-state", () => ({
 }));
 vi.mock("../sessions/pending-instructions", () => ({
   drainPending: vi.fn(async () => []),
+  // Task-end queue check (used once PR #464 lands).
+  hasPending: vi.fn(async () => false),
 }));
 vi.mock("./loop-drain", () => ({ buildMidTaskUserMessage: vi.fn(() => null) }));
 vi.mock("@/background/instruction-broadcast", () => ({
