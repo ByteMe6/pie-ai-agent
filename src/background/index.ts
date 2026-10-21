@@ -146,11 +146,12 @@ import { addPending, cancelPending, drainPending } from "@/lib/sessions/pending-
 import { broadcastInstructionState } from "./instruction-broadcast";
 import { mergeCarryoverIntoMessages } from "@/lib/agent/loop-drain";
 import {
+  admitInstruction,
   beginTask,
   currentGeneration,
   endTask,
-  isSessionEnded,
   makeGuardedTaskEmit,
+  settleQueuedInstruction,
 } from "./task-end-guard";
 import type { ChatInstructionRejectedMessage, PortMessageToPanel } from "@/types/messages";
 import { isFilePdfUrl } from "@/lib/pdf/detect";
@@ -1229,7 +1230,7 @@ async function handleResumeRequest(
   }
 
   await runAgentLoop({
-    emit: makeTaskEmit(port, sessionId, taskGeneration),
+    emit: makeTaskEmit(port, sessionId, taskGeneration, signal),
     task: taskForPrompt,
     modelConfig,
     instanceId: resumeSel.instanceId,
@@ -1418,11 +1419,14 @@ function makeTaskEmit(
   port: chrome.runtime.Port,
   sessionId: string,
   taskGeneration: number,
+  signal: AbortSignal,
 ): (m: PortMessageToPanel) => void {
   return makeGuardedTaskEmit(
     { post: (m) => port.postMessage(m), drainPending },
     sessionId,
     taskGeneration,
+    // A user abort keeps the queue for the next chat-start (P-MTI-9).
+    () => signal.aborted,
   );
 }
 
@@ -1666,7 +1670,7 @@ async function handleChatStream(
         : ("auto" as const);
 
     await runAgentLoop({
-      emit: makeTaskEmit(port, sessionId, taskGeneration),
+      emit: makeTaskEmit(port, sessionId, taskGeneration, signal),
       task,
       modelConfig,
       instanceId: chatSel.instanceId,
@@ -1841,13 +1845,15 @@ chrome.runtime.onConnect.addListener((port) => {
       if (!verifyPortSession(message.sessionId, "chat-instruction-add")) return;
 
       // Reject if the loop has ended for this session — the panel falls back
-      // to chat-start. `isSessionEnded` closes the last window: the task
+      // to chat-start. `admitInstruction` closes the last window: the task
       // already produced its final answer, so nothing will drain the queue
       // again and an instruction accepted now would sit there forever.
-      if (
-        !inFlightSessionIds.has(message.sessionId) ||
-        isSessionEnded(message.sessionId)
-      ) {
+      const admission = admitInstruction(
+        message.sessionId,
+        inFlightSessionIds.has(message.sessionId),
+      );
+      if (admission === "drop") return;
+      if (admission === "reject") {
         const reply: ChatInstructionRejectedMessage = {
           type: "chat-instruction-rejected",
           sessionId: message.sessionId,
@@ -1859,6 +1865,7 @@ chrome.runtime.onConnect.addListener((port) => {
       }
 
       // Append to queue then broadcast new state
+      const addGeneration = currentGeneration(message.sessionId);
       void (async () => {
         try {
           await addPending(message.sessionId, {
@@ -1871,27 +1878,15 @@ chrome.runtime.onConnect.addListener((port) => {
             ...(message.quotes?.length ? { quotes: message.quotes } : {}),
             createdAt: Date.now(),
           });
-          // The task may have ended while this write was in flight — the
-          // instruction would sit in the queue with nobody to drain it. Pull
-          // it back out and let the panel re-send it as a normal chat-start.
-          // `cancelPending` returns false when the instruction was already
-          // taken (the task's final emit reclaims it) — then the panel has
-          // already been told, so don't post a second rejection.
-          if (isSessionEnded(message.sessionId)) {
-            const removed = await cancelPending(
-              message.sessionId,
-              message.chatMessageId,
-            );
-            if (removed) {
-              port.postMessage({
-                type: "chat-instruction-rejected",
-                sessionId: message.sessionId,
-                chatMessageId: message.chatMessageId,
-                reason: "not-streaming",
-              } satisfies ChatInstructionRejectedMessage);
-            }
-            return;
-          }
+          // The task may have ended (or been replaced) while this write was
+          // in flight — see settleQueuedInstruction.
+          const stillQueued = await settleQueuedInstruction(
+            { post: (m) => port.postMessage(m), cancelPending },
+            message.sessionId,
+            message.chatMessageId,
+            addGeneration,
+          );
+          if (!stillQueued) return;
           await broadcastInstructionState((m) => port.postMessage(m), message.sessionId);
         } catch (e) {
           console.warn("[sw] chat-instruction-add failed:", e);

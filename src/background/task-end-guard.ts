@@ -48,6 +48,20 @@ const endedSessionIds = new Set<string>();
 const taskGenerations = new Map<string, number>();
 
 /**
+ * Sessions whose ended task has already handed a late instruction back to the
+ * panel (`chat-instruction-rejected`).
+ *
+ * The panel answers a rejection by re-sending the WHOLE conversation as a new
+ * chat-start — which already contains every instruction the user sent before
+ * that rejection reached it. A second rejection for the same ended task would
+ * make the panel send a second chat-start, which aborts the first fallback
+ * task mid-flight (and its teardown then drops the session from the in-flight
+ * set while the second task runs). So only the first rejection per ended task
+ * is posted; later late instructions are simply removed from the queue.
+ */
+const rejectionPosted = new Set<string>();
+
+/**
  * Register a new task for the session and reopen its instruction queue.
  * Returns the task's generation.
  */
@@ -55,6 +69,7 @@ export function beginTask(sessionId: string): number {
   const generation = (taskGenerations.get(sessionId) ?? 0) + 1;
   taskGenerations.set(sessionId, generation);
   endedSessionIds.delete(sessionId);
+  rejectionPosted.delete(sessionId);
   return generation;
 }
 
@@ -79,6 +94,18 @@ export function isSessionEnded(sessionId: string): boolean {
  */
 export function reopenSession(sessionId: string): void {
   endedSessionIds.delete(sessionId);
+  rejectionPosted.delete(sessionId);
+}
+
+/**
+ * Claim the single fallback rejection of the session's ended task. Returns
+ * true for the first caller only (until the next task begins) — see
+ * `rejectionPosted`.
+ */
+export function claimRejection(sessionId: string): boolean {
+  if (rejectionPosted.has(sessionId)) return false;
+  rejectionPosted.add(sessionId);
+  return true;
 }
 
 /**
@@ -123,6 +150,9 @@ export async function reclaimLateInstructions(
   try {
     const late = await deps.drainPending(sessionId);
     if (late.length === 0) return;
+    // Another late instruction already triggered the panel's fallback
+    // chat-start, whose payload contains these too — draining them is enough.
+    if (!claimRejection(sessionId)) return;
     const first = late[0]!;
     deps.post({
       type: "chat-instruction-rejected",
@@ -142,15 +172,84 @@ export async function reclaimLateInstructions(
  * The task's generation is passed in (taken when the task was dispatched), so
  * a superseded task's late terminal emit cannot close the queue of the task
  * that replaced it.
+ *
+ * `isAborted` reports whether the task was stopped by the user. An aborted
+ * task's terminal emit does NOT reclaim the queue: per P-MTI-9 the queue
+ * survives an abort and is carried over into the user's next chat-start.
+ * Reclaiming here would make the panel immediately start a new task — the
+ * agent would restart on its own right after the user pressed Stop.
  */
 export function makeGuardedTaskEmit(
   deps: TaskEndGuardDeps,
   sessionId: string,
   generation: number,
+  isAborted: () => boolean = () => false,
 ): (m: PortMessageToPanel) => void {
   return (m) => {
     deps.post(m);
     if (m.type !== "chat-done" && m.type !== "agent-done-task") return;
+    if (isAborted()) return;
     endTask(deps, sessionId, generation);
   };
+}
+
+/**
+ * Admission check for a `chat-instruction-add`.
+ *
+ *   - "accept": the task is running and its queue is open.
+ *   - "reject": post `chat-instruction-rejected` — the panel falls back to a
+ *     normal chat-start.
+ *   - "drop":   the session's ended task already handed one late instruction
+ *     back; the panel's fallback chat-start carries this one too (it was sent
+ *     before the panel saw the task end), so a second rejection would only
+ *     start a second task that aborts the first.
+ */
+export function admitInstruction(
+  sessionId: string,
+  inFlight: boolean,
+): "accept" | "reject" | "drop" {
+  if (isSessionEnded(sessionId)) {
+    return claimRejection(sessionId) ? "reject" : "drop";
+  }
+  return inFlight ? "accept" : "reject";
+}
+
+/**
+ * After an accepted instruction has been written to the queue: make sure it
+ * did not land in a queue nobody will drain. Returns true when it stays
+ * queued for the running task.
+ *
+ *   - A NEW task began while the write was in flight (the panel's fallback
+ *     chat-start for an earlier late instruction overtook it): that
+ *     chat-start's payload already contains this instruction, so it is pulled
+ *     back out silently — leaving it queued would hand it to the new task a
+ *     second time (carry-over / mid-task drain).
+ *   - The task ended meanwhile: pull it back out and hand it to the panel —
+ *     unless the task's final emit already took it, or another late
+ *     instruction already triggered the (single) fallback.
+ */
+export async function settleQueuedInstruction(
+  deps: {
+    post: (m: PortMessageToPanel) => void;
+    cancelPending: (sessionId: string, chatMessageId: string) => Promise<boolean>;
+  },
+  sessionId: string,
+  chatMessageId: string,
+  addGeneration: number,
+): Promise<boolean> {
+  if (currentGeneration(sessionId) !== addGeneration) {
+    await deps.cancelPending(sessionId, chatMessageId);
+    return false;
+  }
+  if (!isSessionEnded(sessionId)) return true;
+  const removed = await deps.cancelPending(sessionId, chatMessageId);
+  if (removed && claimRejection(sessionId)) {
+    deps.post({
+      type: "chat-instruction-rejected",
+      sessionId,
+      chatMessageId,
+      reason: "not-streaming",
+    });
+  }
+  return false;
 }

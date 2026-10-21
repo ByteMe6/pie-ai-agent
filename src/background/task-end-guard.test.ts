@@ -1,5 +1,6 @@
 import { describe, it, expect, beforeEach, vi } from "vitest";
 import {
+  admitInstruction,
   beginTask,
   currentGeneration,
   endTask,
@@ -8,6 +9,7 @@ import {
   markSessionEnded,
   reclaimLateInstructions,
   reopenSession,
+  settleQueuedInstruction,
 } from "./task-end-guard";
 import type { PortMessageToPanel } from "@/types/messages";
 import type { PendingInstruction } from "@/lib/sessions/types";
@@ -218,5 +220,142 @@ describe("task generations", () => {
     expect(isSessionEnded(SESSION_ID)).toBe(false);
     expect(queue).toHaveLength(1);
     expect(posted.filter((m) => m.type === "chat-instruction-rejected")).toHaveLength(0);
+  });
+});
+
+describe("user abort (P-MTI-9: the queue survives an abort)", () => {
+  it("an aborted task's terminal emit neither closes nor reclaims the queue", async () => {
+    // Regression: reclaiming on abort posted chat-instruction-rejected, and
+    // the panel answered with a chat-start — the agent restarted on its own
+    // right after the user pressed Stop.
+    const queue = [instr("queued-before-stop")];
+    const { posted, deps } = makeDeps(queue);
+    const gen = beginTask(SESSION_ID);
+    const emit = makeGuardedTaskEmit(deps, SESSION_ID, gen, () => true);
+
+    emit({ type: "agent-done-task", success: false, summary: "aborted", stepCount: 2, sessionId: SESSION_ID });
+    await new Promise((r) => setTimeout(r, 5));
+
+    expect(posted.map((m) => m.type)).toEqual(["agent-done-task"]);
+    expect(isSessionEnded(SESSION_ID)).toBe(false);
+    expect(queue).toHaveLength(1); // carried over into the next chat-start
+  });
+
+  it("a non-aborted task still reclaims", async () => {
+    const queue = [instr("late")];
+    const { posted, deps } = makeDeps(queue);
+    const gen = beginTask(SESSION_ID);
+    const emit = makeGuardedTaskEmit(deps, SESSION_ID, gen, () => false);
+    emit({ type: "chat-done", sessionId: SESSION_ID });
+    await vi.waitFor(() => expect(posted).toHaveLength(2));
+    expect(queue).toHaveLength(0);
+  });
+});
+
+describe("one fallback rejection per ended task", () => {
+  function settleDeps(queue: PendingInstruction[]) {
+    const posted: PortMessageToPanel[] = [];
+    return {
+      posted,
+      deps: {
+        post: (m: PortMessageToPanel) => {
+          posted.push(m);
+        },
+        cancelPending: async (_sid: string, id: string) => {
+          const i = queue.findIndex((p) => p.chatMessageId === id);
+          if (i < 0) return false;
+          queue.splice(i, 1);
+          return true;
+        },
+      },
+    };
+  }
+
+  it("reclaim + a late add whose write lands after the drain → ONE rejection", async () => {
+    // Regression: A sits in the queue at task end (reclaimed → rejection 1);
+    // B's addPending commits after the reclaim drain → it was rejected too,
+    // and the panel's second chat-start aborted the first fallback task.
+    const queue = [instr("A")];
+    const { posted, deps } = makeDeps(queue);
+    const gen = beginTask(SESSION_ID);
+    const addGeneration = currentGeneration(SESSION_ID); // B accepted mid-task
+    makeGuardedTaskEmit(deps, SESSION_ID, gen)({ type: "chat-done", sessionId: SESSION_ID });
+    await vi.waitFor(() => expect(posted).toHaveLength(2));
+
+    queue.push(instr("B")); // B's write lands now
+    const s = settleDeps(queue);
+    const stillQueued = await settleQueuedInstruction(s.deps, SESSION_ID, "B", addGeneration);
+
+    expect(stillQueued).toBe(false);
+    expect(queue).toHaveLength(0); // not stranded
+    expect(s.posted).toHaveLength(0); // no second rejection
+  });
+
+  it("two instruction-adds arriving after the task ended → ONE rejection", () => {
+    beginTask(SESSION_ID);
+    markSessionEnded(SESSION_ID);
+    expect(admitInstruction(SESSION_ID, true)).toBe("reject");
+    expect(admitInstruction(SESSION_ID, true)).toBe("drop");
+    expect(admitInstruction(SESSION_ID, false)).toBe("drop");
+  });
+
+  it("a late add after the reclaim already rejected is dropped, not rejected again", async () => {
+    const { posted, deps } = makeDeps([instr("A")]);
+    const gen = beginTask(SESSION_ID);
+    endTask(deps, SESSION_ID, gen);
+    await vi.waitFor(() => expect(posted).toHaveLength(1));
+    expect(admitInstruction(SESSION_ID, true)).toBe("drop");
+  });
+
+  it("the next task reopens the queue and resets the rejection budget", () => {
+    beginTask(SESSION_ID);
+    markSessionEnded(SESSION_ID);
+    expect(admitInstruction(SESSION_ID, true)).toBe("reject");
+    beginTask(SESSION_ID);
+    expect(admitInstruction(SESSION_ID, true)).toBe("accept");
+    markSessionEnded(SESSION_ID);
+    expect(admitInstruction(SESSION_ID, false)).toBe("reject");
+  });
+
+  it("not in flight and not ended → reject every time (SW-restart fallback unchanged)", () => {
+    beginTask(SESSION_ID);
+    expect(admitInstruction(SESSION_ID, false)).toBe("reject");
+    expect(admitInstruction(SESSION_ID, false)).toBe("reject");
+  });
+
+  it("first late add whose write lands after the end, with no reclaim rejection yet → rejected", async () => {
+    const queue: PendingInstruction[] = [];
+    const gen = beginTask(SESSION_ID);
+    markSessionEnded(SESSION_ID);
+    void gen;
+    queue.push(instr("B"));
+    const s = settleDeps(queue);
+    expect(await settleQueuedInstruction(s.deps, SESSION_ID, "B", currentGeneration(SESSION_ID))).toBe(false);
+    expect(queue).toHaveLength(0);
+    expect(s.posted).toEqual([
+      { type: "chat-instruction-rejected", sessionId: SESSION_ID, chatMessageId: "B", reason: "not-streaming" },
+    ]);
+  });
+
+  it("a new task began while the write was in flight → pulled out silently (no duplicate delivery)", async () => {
+    // The panel's fallback chat-start (which already contains B) overtook
+    // B's queue write; leaving B queued would hand it to the new task twice.
+    const queue: PendingInstruction[] = [];
+    const addGeneration = beginTask(SESSION_ID);
+    markSessionEnded(SESSION_ID);
+    beginTask(SESSION_ID); // fallback chat-start
+    queue.push(instr("B"));
+    const s = settleDeps(queue);
+    expect(await settleQueuedInstruction(s.deps, SESSION_ID, "B", addGeneration)).toBe(false);
+    expect(queue).toHaveLength(0);
+    expect(s.posted).toHaveLength(0);
+  });
+
+  it("running task, same generation → stays queued", async () => {
+    const queue = [instr("B")];
+    const gen = beginTask(SESSION_ID);
+    const s = settleDeps(queue);
+    expect(await settleQueuedInstruction(s.deps, SESSION_ID, "B", gen)).toBe(true);
+    expect(queue).toHaveLength(1);
   });
 });
