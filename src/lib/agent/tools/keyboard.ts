@@ -168,8 +168,16 @@ async function sendKeyPress(
 ): Promise<void> {
   const mapping = KEY_MAP[keyName];
   if (!mapping) throw new Error(`No mapping for key '${keyName}'`);
+  // Letter keys: KeyboardEvent.key is the produced character — "a" for
+  // Ctrl/Cmd+A, "A" only with Shift — exactly what a real keypress reports.
+  // Editors that bind chords by event.key ("Mod-b", is-hotkey, Quill) never
+  // match an unshifted "B".
+  const key =
+    /^[A-Z]$/.test(keyName) && (modifiers & MODIFIER_SHIFT) === 0
+      ? keyName.toLowerCase()
+      : keyName;
   const baseParams: Record<string, unknown> = {
-    key: keyName,
+    key,
     code: mapping.code,
     windowsVirtualKeyCode: mapping.windowsVirtualKeyCode,
     nativeVirtualKeyCode: mapping.windowsVirtualKeyCode,

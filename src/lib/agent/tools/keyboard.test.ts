@@ -323,9 +323,18 @@ describe("press_key — modifiers (#123)", () => {
     expect(result.success).toBe(true);
     const downs = keyDowns();
     expect(downs).toHaveLength(1);
-    expect(downs[0].params).toMatchObject({ key: "F", code: "KeyF", windowsVirtualKeyCode: 70, modifiers: META });
+    expect(downs[0].params).toMatchObject({ key: "f", code: "KeyF", windowsVirtualKeyCode: 70, modifiers: META });
     // Not an editing command — no `commands` on mac.
     expect(downs[0].params?.commands).toBeUndefined();
+  });
+
+  it("letter chords report the produced character as key: lowercase, uppercase only with shift", async () => {
+    const tool = getPressKeyTool();
+    await tool.handler({ key: "B", modifiers: ["mod"] }, ctx());
+    await tool.handler({ key: "Z", modifiers: ["mod", "shift"] }, ctx());
+    const downs = keyDowns();
+    expect(downs.map((d) => d.params?.key)).toEqual(["b", "Z"]);
+    expect(downs.map((d) => d.params?.code)).toEqual(["KeyB", "KeyZ"]);
   });
 
   it("schema enum lists every letter plus Delete / PageUp / PageDown", () => {
