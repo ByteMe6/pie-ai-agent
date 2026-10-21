@@ -1,5 +1,8 @@
 import { describe, it, expect, beforeEach, vi } from "vitest";
 import {
+  beginTask,
+  currentGeneration,
+  endTask,
   isSessionEnded,
   makeGuardedTaskEmit,
   markSessionEnded,
@@ -141,5 +144,52 @@ describe("reclaimLateInstructions", () => {
       type: "chat-instruction-rejected",
       chatMessageId: "x",
     });
+  });
+});
+
+describe("task generations", () => {
+  it("beginTask bumps the generation and reopens the queue", () => {
+    beginTask(SESSION_ID);
+    markSessionEnded(SESSION_ID);
+    expect(isSessionEnded(SESSION_ID)).toBe(true);
+    const gen = beginTask(SESSION_ID);
+    expect(isSessionEnded(SESSION_ID)).toBe(false);
+    expect(currentGeneration(SESSION_ID)).toBe(gen);
+  });
+
+  it("a superseded task's terminal emit does not close the new task's queue", async () => {
+    const queue = [instr("for-the-new-task")];
+    const { posted, deps } = makeDeps(queue);
+
+    // Task A starts…
+    beginTask(SESSION_ID);
+    const emitA = makeGuardedTaskEmit(deps, SESSION_ID);
+
+    // …the panel starts task B before A winds down.
+    beginTask(SESSION_ID);
+    const emitB = makeGuardedTaskEmit(deps, SESSION_ID);
+
+    // A's late terminal emit (the abort path emits from the loop's finally,
+    // after the new task already started) must not touch B's queue.
+    emitA({ type: "agent-done-task", success: false, summary: "aborted", stepCount: 2, sessionId: SESSION_ID });
+    await new Promise((r) => setTimeout(r, 5));
+
+    expect(isSessionEnded(SESSION_ID)).toBe(false);
+    expect(posted.filter((m) => m.type === "chat-instruction-rejected")).toHaveLength(0);
+    expect(queue).toHaveLength(1); // B's instruction is untouched
+
+    // B's own terminal emit does close the queue.
+    emitB({ type: "chat-done", sessionId: SESSION_ID });
+    await vi.waitFor(() => expect(isSessionEnded(SESSION_ID)).toBe(true));
+  });
+
+  it("endTask is a no-op for a stale generation", async () => {
+    const { posted, deps } = makeDeps([instr("x")]);
+    const stale = currentGeneration(SESSION_ID);
+    beginTask(SESSION_ID); // a newer task takes over
+    endTask(deps, SESSION_ID, stale);
+    await new Promise((r) => setTimeout(r, 5));
+    expect(isSessionEnded(SESSION_ID)).toBe(false);
+    expect(posted).toHaveLength(0);
   });
 });

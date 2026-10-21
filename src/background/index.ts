@@ -146,11 +146,11 @@ import { addPending, cancelPending, drainPending } from "@/lib/sessions/pending-
 import { broadcastInstructionState } from "./instruction-broadcast";
 import { mergeCarryoverIntoMessages } from "@/lib/agent/loop-drain";
 import {
+  beginTask,
+  currentGeneration,
+  endTask,
   isSessionEnded,
   makeGuardedTaskEmit,
-  markSessionEnded,
-  reclaimLateInstructions,
-  reopenSession,
 } from "./task-end-guard";
 import type { ChatInstructionRejectedMessage, PortMessageToPanel } from "@/types/messages";
 import { isFilePdfUrl } from "@/lib/pdf/detect";
@@ -1340,10 +1340,12 @@ async function handleDiscardRequest(
     sessionId,
   } satisfies AgentDoneTaskMessage);
   // The task is over — the instruction queue will not be drained again.
-  markSessionEnded(sessionId);
-  void reclaimLateInstructions(
+  // Generation-guarded: a task that was superseded while it was winding down
+  // must not close the queue of the task that replaced it.
+  endTask(
     { post: (m) => port.postMessage(m), drainPending },
     sessionId,
+    currentGeneration(sessionId),
   );
 }
 
@@ -1812,7 +1814,7 @@ chrome.runtime.onConnect.addListener((port) => {
       inFlightSessionIds.add(message.sessionId);
       runningSessionIds.add(message.sessionId);
       // A new task reopens the instruction queue.
-      reopenSession(message.sessionId);
+      beginTask(message.sessionId);
       keepAlive.ensure();
       handleChatStream(
         port,
@@ -1914,7 +1916,7 @@ chrome.runtime.onConnect.addListener((port) => {
       inFlightSessionIds.add(message.sessionId);
       runningSessionIds.add(message.sessionId);
       // A resumed task reopens the instruction queue.
-      reopenSession(message.sessionId);
+      beginTask(message.sessionId);
       keepAlive.ensure();
       handleResumeRequest(
         port,

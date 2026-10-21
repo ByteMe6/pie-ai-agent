@@ -32,6 +32,37 @@ import type { PendingInstruction } from "@/lib/sessions/types";
  */
 const endedSessionIds = new Set<string>();
 
+/**
+ * Per-session task generation.
+ *
+ * A task that is superseded (the panel starts a new one while the old is
+ * still winding down) can still emit its terminal message afterwards — the
+ * abort path emits `agent-done-task` from the loop's `finally`, which lands
+ * AFTER the new task started. Without a generation guard that late emit
+ * would mark the NEW task's session as ended (closing its instruction queue)
+ * and reclaim instructions belonging to it.
+ *
+ * Every task takes a generation number; a terminal emit only counts if its
+ * generation is still the session's current one.
+ */
+const taskGenerations = new Map<string, number>();
+
+/**
+ * Register a new task for the session and reopen its instruction queue.
+ * Returns the task's generation.
+ */
+export function beginTask(sessionId: string): number {
+  const generation = (taskGenerations.get(sessionId) ?? 0) + 1;
+  taskGenerations.set(sessionId, generation);
+  endedSessionIds.delete(sessionId);
+  return generation;
+}
+
+/** The generation of the session's current task (0 = none yet). */
+export function currentGeneration(sessionId: string): number {
+  return taskGenerations.get(sessionId) ?? 0;
+}
+
 /** Mark a session's task as finished — the instruction queue is now closed. */
 export function markSessionEnded(sessionId: string): void {
   endedSessionIds.add(sessionId);
@@ -48,6 +79,23 @@ export function isSessionEnded(sessionId: string): boolean {
  */
 export function reopenSession(sessionId: string): void {
   endedSessionIds.delete(sessionId);
+}
+
+/**
+ * Close the queue for a task and hand back anything still in it.
+ *
+ * No-op when the task has been superseded (a newer task took over the
+ * session): that newer task owns the queue now, and its instructions must
+ * not be reclaimed by the old one.
+ */
+export function endTask(
+  deps: TaskEndGuardDeps,
+  sessionId: string,
+  generation: number,
+): void {
+  if (currentGeneration(sessionId) !== generation) return;
+  markSessionEnded(sessionId);
+  void reclaimLateInstructions(deps, sessionId);
 }
 
 export interface TaskEndGuardDeps {
@@ -90,15 +138,19 @@ export async function reclaimLateInstructions(
 /**
  * The task's emit wrapper. A task's final answer closes the queue; anything
  * still in it at that moment is handed back to the panel.
+ *
+ * The task's generation is captured when the wrapper is created (i.e. when the
+ * task starts), so a superseded task's late terminal emit cannot close the
+ * queue of the task that replaced it.
  */
 export function makeGuardedTaskEmit(
   deps: TaskEndGuardDeps,
   sessionId: string,
 ): (m: PortMessageToPanel) => void {
+  const generation = currentGeneration(sessionId);
   return (m) => {
     deps.post(m);
     if (m.type !== "chat-done" && m.type !== "agent-done-task") return;
-    markSessionEnded(sessionId);
-    void reclaimLateInstructions(deps, sessionId);
+    endTask(deps, sessionId, generation);
   };
 }
