@@ -145,7 +145,14 @@ import {
 import { addPending, cancelPending, drainPending } from "@/lib/sessions/pending-instructions";
 import { broadcastInstructionState } from "./instruction-broadcast";
 import { mergeCarryoverIntoMessages } from "@/lib/agent/loop-drain";
-import type { ChatInstructionRejectedMessage } from "@/types/messages";
+import {
+  isSessionEnded,
+  makeGuardedTaskEmit,
+  markSessionEnded,
+  reclaimLateInstructions,
+  reopenSession,
+} from "./task-end-guard";
+import type { ChatInstructionRejectedMessage, PortMessageToPanel } from "@/types/messages";
 import { isFilePdfUrl } from "@/lib/pdf/detect";
 import { installLogCapture } from "@/lib/log-buffer";
 import {
@@ -1221,7 +1228,7 @@ async function handleResumeRequest(
   }
 
   await runAgentLoop({
-    emit: (m) => port.postMessage(m),
+    emit: makeTaskEmit(port, sessionId),
     task: taskForPrompt,
     modelConfig,
     instanceId: resumeSel.instanceId,
@@ -1332,6 +1339,12 @@ async function handleDiscardRequest(
     stepCount: lastStepIndex,
     sessionId,
   } satisfies AgentDoneTaskMessage);
+  // The task is over — the instruction queue will not be drained again.
+  markSessionEnded(sessionId);
+  void reclaimLateInstructions(
+    { post: (m) => port.postMessage(m), drainPending },
+    sessionId,
+  );
 }
 
 // --- Agent Loop via Port ---
@@ -1381,6 +1394,28 @@ function makeStepSnapshotHandler(sessionId: string) {
       });
     }
   };
+}
+
+/**
+ * Issue #34 follow-up — the task's emit wrapper.
+ *
+ * A task's final answer (`chat-done` for a plain reply, `agent-done-task` for
+ * a `done`/`fail` termination) closes the mid-task instruction queue: the
+ * loop drains it at the top of every step and there is no step after this
+ * one. An instruction that lands in the last window — between the loop's
+ * final queue check and this emit — would sit in the queue forever: the user
+ * sees it as sent, the agent never answers it.
+ *
+ * The SW arbitrates that window — see `task-end-guard.ts`.
+ */
+function makeTaskEmit(
+  port: chrome.runtime.Port,
+  sessionId: string,
+): (m: PortMessageToPanel) => void {
+  return makeGuardedTaskEmit(
+    { post: (m) => port.postMessage(m), drainPending },
+    sessionId,
+  );
 }
 
 async function handleChatStream(
@@ -1622,7 +1657,7 @@ async function handleChatStream(
         : ("auto" as const);
 
     await runAgentLoop({
-      emit: (m) => port.postMessage(m),
+      emit: makeTaskEmit(port, sessionId),
       task,
       modelConfig,
       instanceId: chatSel.instanceId,
@@ -1776,6 +1811,8 @@ chrome.runtime.onConnect.addListener((port) => {
       rotateAbortController(abortRotation, () => {});
       inFlightSessionIds.add(message.sessionId);
       runningSessionIds.add(message.sessionId);
+      // A new task reopens the instruction queue.
+      reopenSession(message.sessionId);
       keepAlive.ensure();
       handleChatStream(
         port,
@@ -1791,8 +1828,14 @@ chrome.runtime.onConnect.addListener((port) => {
     } else if (message.type === "chat-instruction-add") {
       if (!verifyPortSession(message.sessionId, "chat-instruction-add")) return;
 
-      // Reject if loop has ended for this session — panel will fall back to chat-start
-      if (!inFlightSessionIds.has(message.sessionId)) {
+      // Reject if the loop has ended for this session — the panel falls back
+      // to chat-start. `isSessionEnded` closes the last window: the task
+      // already produced its final answer, so nothing will drain the queue
+      // again and an instruction accepted now would sit there forever.
+      if (
+        !inFlightSessionIds.has(message.sessionId) ||
+        isSessionEnded(message.sessionId)
+      ) {
         const reply: ChatInstructionRejectedMessage = {
           type: "chat-instruction-rejected",
           sessionId: message.sessionId,
@@ -1816,6 +1859,27 @@ chrome.runtime.onConnect.addListener((port) => {
             ...(message.quotes?.length ? { quotes: message.quotes } : {}),
             createdAt: Date.now(),
           });
+          // The task may have ended while this write was in flight — the
+          // instruction would sit in the queue with nobody to drain it. Pull
+          // it back out and let the panel re-send it as a normal chat-start.
+          // `cancelPending` returns false when the instruction was already
+          // taken (the task's final emit reclaims it) — then the panel has
+          // already been told, so don't post a second rejection.
+          if (isSessionEnded(message.sessionId)) {
+            const removed = await cancelPending(
+              message.sessionId,
+              message.chatMessageId,
+            );
+            if (removed) {
+              port.postMessage({
+                type: "chat-instruction-rejected",
+                sessionId: message.sessionId,
+                chatMessageId: message.chatMessageId,
+                reason: "not-streaming",
+              } satisfies ChatInstructionRejectedMessage);
+            }
+            return;
+          }
           await broadcastInstructionState((m) => port.postMessage(m), message.sessionId);
         } catch (e) {
           console.warn("[sw] chat-instruction-add failed:", e);
@@ -1849,6 +1913,8 @@ chrome.runtime.onConnect.addListener((port) => {
       rotateAbortController(abortRotation, () => {});
       inFlightSessionIds.add(message.sessionId);
       runningSessionIds.add(message.sessionId);
+      // A resumed task reopens the instruction queue.
+      reopenSession(message.sessionId);
       keepAlive.ensure();
       handleResumeRequest(
         port,
