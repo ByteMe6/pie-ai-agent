@@ -57,4 +57,31 @@ describe("MCP tool names", () => {
     expect(isMcpGroupId("mcp:docs")).toBe(true);
     expect(isMcpGroupId("pdf")).toBe(false);
   });
+
+  it("no exposed-name collision across servers via '__' in a server name", () => {
+    // "a _b" sanitizes to "a__b"; tool "c" there would equal server "a"'s tool "b__c".
+    const slugs = assignServerSlugs([
+      { id: "x", name: "a" },
+      { id: "y", name: "a _b" },
+    ]);
+    const a = exposeToolNames(slugs.get("x")!, ["b__c"])[0].exposedName;
+    const b = exposeToolNames(slugs.get("y")!, ["c"])[0].exposedName;
+    expect(a).not.toBe(b);
+    for (const s of slugs.values()) expect(s).not.toMatch(/__|^_|_$/);
+  });
+
+  it("hashed collision slugs contain no '__' and never take another server's natural slug", () => {
+    const servers = [
+      { id: "1", name: "abcdefgh_xyz" },
+      { id: "2", name: "abcdefgh_xyz" },
+    ];
+    const first = assignServerSlugs(servers);
+    for (const s of first.values()) expect(s).not.toContain("__");
+    // A third server literally named like server 1's hashed slug keeps its own name;
+    // server 1 must move off it.
+    const taken = first.get("1")!;
+    const again = assignServerSlugs([...servers, { id: "3", name: taken }]);
+    expect(new Set(again.values()).size).toBe(3);
+    expect(again.get("3")).toBe(taken);
+  });
 });

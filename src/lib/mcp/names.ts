@@ -25,9 +25,19 @@ function clean(s: string): string {
   return s.replace(/[^a-zA-Z0-9_-]+/g, "_").replace(/^_+|_+$/g, "");
 }
 
+/**
+ * Slugs never contain "__" and never start/end with "_": the first "__" after
+ * `mcp__` then always marks the slug/tool boundary, so two servers can never
+ * produce the same exposed name (server "a" + tool "b__c" vs server "a__b" +
+ * tool "c" would both be `mcp__a__b__c`).
+ */
+function slugSafe(s: string): string {
+  return s.replace(/_{2,}/g, "_").replace(/^_+|_+$/g, "");
+}
+
 /** Server display name → short identifier used in tool and group names. */
 export function serverSlug(name: string, id: string): string {
-  const base = clean(name.toLowerCase()).slice(0, MAX_SLUG_LENGTH).replace(/_+$/, "");
+  const base = slugSafe(slugSafe(clean(name.toLowerCase())).slice(0, MAX_SLUG_LENGTH));
   return base || `s${shortHash(id)}`;
 }
 
@@ -42,10 +52,17 @@ export function assignServerSlugs(
   const counts = new Map<string, number>();
   for (const r of raw) counts.set(r.slug, (counts.get(r.slug) ?? 0) + 1);
   const out = new Map<string, string>();
+  const used = new Set(raw.filter((r) => counts.get(r.slug) === 1).map((r) => r.slug));
   for (const r of raw) {
-    const slug = (counts.get(r.slug) ?? 0) > 1
-      ? `${r.slug.slice(0, MAX_SLUG_LENGTH - 7)}_${shortHash(r.id)}`
-      : r.slug;
+    if (counts.get(r.slug) === 1) {
+      out.set(r.id, r.slug);
+      continue;
+    }
+    // Disambiguate; also never land on another server's natural slug.
+    const head = slugSafe(r.slug.slice(0, MAX_SLUG_LENGTH - 7));
+    let slug = slugSafe(`${head}_${shortHash(r.id)}`);
+    for (let n = 1; used.has(slug); n++) slug = slugSafe(`${head}_${shortHash(`${r.id}#${n}`)}`);
+    used.add(slug);
     out.set(r.id, slug);
   }
   return out;
