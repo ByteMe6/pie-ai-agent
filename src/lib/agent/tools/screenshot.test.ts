@@ -203,6 +203,16 @@ describe("screenshot geometry recording (click_at)", () => {
     expect(getScreenshotGeometry("s1", 42)).toBeUndefined();
   });
 
+  it("page moved during the capture (smooth scroll) → no geometry recorded", async () => {
+    let call = 0;
+    (globalThis as any).chrome.scripting.executeScript = vi.fn(async () => [
+      { result: { ...PROBE, scrollY: call++ === 0 ? 120 : 300 } },
+    ]);
+    const res = await dispatchCaptureVisibleTab({ sessionId: "s1", pinnedTabId: 42 });
+    expect(res.ok).toBe(true);
+    expect(getScreenshotGeometry("s1", 42)).toBeUndefined();
+  });
+
   it("capture_fullpage_tab invalidates geometry (page-relative image)", async () => {
     recordScreenshotGeometry("s1", 42, { ...PROBE, imageWidth: 1, imageHeight: 1, capturedAt: Date.now() });
     await dispatchCaptureFullPageTab(
