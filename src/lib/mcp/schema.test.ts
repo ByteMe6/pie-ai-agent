@@ -58,7 +58,7 @@ describe("sanitizeInputSchema", () => {
     expect(out.properties).toEqual({
       a: { type: "string" },
       b: { type: "integer" },
-      c: { enum: ["after"] },
+      c: { type: "string", enum: ["after"] },
       d: { anyOf: [{ type: "string" }, { type: "integer" }] },
     });
   });
@@ -84,5 +84,64 @@ describe("sanitizeInputSchema", () => {
     expect(out.additionalProperties).toBe(false);
     expect((out.properties as Record<string, unknown>).m).toEqual({ type: "object" });
     expect((out.properties as Record<string, unknown>).list).toEqual({ type: "array", items: {} });
+  });
+
+  it("drops keywords outside the provider-safe subset (Gemini 400s on unknown field names)", () => {
+    const out = sanitizeInputSchema({
+      type: "object",
+      properties: {
+        n: { type: "number", exclusiveMinimum: 0, multipleOf: 2, minimum: 1, maximum: 9, description: "count" },
+        tags: { type: "array", items: { type: "string" }, uniqueItems: true, maxItems: 3 },
+        s: { type: "string", "x-google-enum-descriptions": ["a"], nullable: true, pattern: "^a" },
+        old: { type: "string", required: true },
+      },
+    });
+    expect(out.properties).toEqual({
+      n: { type: "number", minimum: 1, maximum: 9, description: "count" },
+      tags: { type: "array", items: { type: "string" }, maxItems: 3 },
+      s: { type: "string", pattern: "^a" },
+      old: { type: "string" },
+    });
+  });
+
+  it("keeps only all-string enums (Gemini rejects enum on non-string types)", () => {
+    const out = sanitizeInputSchema({
+      type: "object",
+      properties: {
+        level: { type: "integer", enum: [1, 2, 3] },
+        mode: { enum: ["a", "b"] },
+        one: { const: 5 },
+      },
+    });
+    expect(out.properties).toEqual({
+      level: { type: "integer" },
+      mode: { type: "string", enum: ["a", "b"] },
+      one: {},
+    });
+  });
+
+  it("top-level anyOf/oneOf is flattened into one object (Anthropic rejects root unions)", () => {
+    const out = sanitizeInputSchema({
+      oneOf: [
+        { type: "object", properties: { id: { type: "string" } }, required: ["id"] },
+        { type: "object", properties: { url: { type: "string" } }, required: ["url"] },
+      ],
+    });
+    expect(out).toEqual({
+      type: "object",
+      properties: { id: { type: "string" }, url: { type: "string" } },
+    });
+  });
+
+  it("bounds $ref fan-out (exponential inlining cannot blow up)", () => {
+    const defs: Record<string, unknown> = {};
+    for (let d = 0; d < 12; d++) {
+      const props: Record<string, unknown> = {};
+      for (let i = 0; i < 10; i++) props[`p${i}`] = { $ref: `#/$defs/D${d + 1}` };
+      defs[`D${d}`] = { type: "object", properties: props };
+    }
+    defs.D12 = { type: "string" };
+    const out = sanitizeInputSchema({ type: "object", $defs: defs, properties: { root: { $ref: "#/$defs/D0" } } });
+    expect(JSON.stringify(out).length).toBeLessThan(200_000);
   });
 });

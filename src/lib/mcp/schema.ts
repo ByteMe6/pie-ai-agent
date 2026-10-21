@@ -18,6 +18,22 @@ const DROP_KEYS = new Set([
   "prefixItems", "contains", "minContains", "maxContains", "title", "default",
 ]);
 
+// Every other key is copied through only if listed here. Anything else —
+// exclusiveMinimum, multipleOf, uniqueItems, x-* vendor extensions, … — is
+// dropped: Gemini parses `parameters` as a proto and 400s the WHOLE request on
+// any unknown field name, which would break every turn once the server's group
+// is loaded.
+const PASSTHROUGH_KEYS = new Set([
+  "description", "required", "minimum", "maximum", "minLength", "maxLength",
+  "minItems", "maxItems", "pattern",
+]);
+
+// Upper bound on schema nodes emitted per tool. $ref inlining can fan out
+// exponentially (N properties each referencing a def that again has N ref'd
+// properties …); a hostile or merely huge server schema must not stall the
+// service worker or bloat every request.
+const MAX_NODES = 1_000;
+
 // Gemini only accepts these string formats.
 const KEEP_FORMATS = new Set(["date-time", "enum"]);
 
@@ -35,21 +51,26 @@ function resolveRef(ref: string, root: Schema): Schema | undefined {
   return isObj(defs) && isObj(defs[name]) ? (defs[name] as Schema) : undefined;
 }
 
-function clean(node: unknown, root: Schema, depth: number, refStack: string[]): Schema {
-  if (!isObj(node) || depth > MAX_DEPTH) return {};
+interface Ctx {
+  root: Schema;
+  nodes: number;
+}
+
+function clean(node: unknown, ctx: Ctx, depth: number, refStack: string[]): Schema {
+  if (!isObj(node) || depth > MAX_DEPTH || ++ctx.nodes > MAX_NODES) return {};
 
   if (typeof node.$ref === "string") {
     if (refStack.includes(node.$ref)) return {}; // recursive type — cut the cycle
-    const target = resolveRef(node.$ref, root);
+    const target = resolveRef(node.$ref, ctx.root);
     const merged = target ? { ...target, ...withoutKey(node, "$ref") } : withoutKey(node, "$ref");
-    return clean(merged, root, depth + 1, [...refStack, node.$ref]);
+    return clean(merged, ctx, depth + 1, [...refStack, node.$ref]);
   }
 
   // allOf: shallow-merge object members (the common zod/pydantic output).
   if (Array.isArray(node.allOf)) {
     let merged: Schema = withoutKey(node, "allOf");
     for (const part of node.allOf) {
-      const c = clean(part, root, depth + 1, refStack);
+      const c = clean(part, ctx, depth + 1, refStack);
       merged = {
         ...c,
         ...merged,
@@ -59,7 +80,7 @@ function clean(node: unknown, root: Schema, depth: number, refStack: string[]): 
     }
     if (Object.keys(merged.properties as Schema).length === 0) delete merged.properties;
     if ((merged.required as string[]).length === 0) delete merged.required;
-    return clean(merged, root, depth + 1, refStack);
+    return clean(merged, ctx, depth + 1, refStack);
   }
 
   const out: Schema = {};
@@ -75,13 +96,15 @@ function clean(node: unknown, root: Schema, depth: number, refStack: string[]): 
         }
         break;
       }
+      // Gemini accepts `enum` only on strings; non-string values are dropped
+      // (the description still documents them for the model).
       case "const":
-        out.enum = [v];
+        if (typeof v === "string") out.enum = [v];
         break;
       case "enum":
         if (Array.isArray(v)) {
           const vals = v.filter((x) => x !== null);
-          if (vals.length > 0) out.enum = vals;
+          if (vals.length > 0 && vals.every((x) => typeof x === "string")) out.enum = vals;
         }
         break;
       case "format":
@@ -90,19 +113,19 @@ function clean(node: unknown, root: Schema, depth: number, refStack: string[]): 
       case "properties":
         if (isObj(v)) {
           const props: Schema = {};
-          for (const [pk, pv] of Object.entries(v)) props[pk] = clean(pv, root, depth + 1, refStack);
+          for (const [pk, pv] of Object.entries(v)) props[pk] = clean(pv, ctx, depth + 1, refStack);
           out.properties = props;
         }
         break;
       case "items":
-        out.items = Array.isArray(v) ? clean(v[0], root, depth + 1, refStack) : clean(v, root, depth + 1, refStack);
+        out.items = Array.isArray(v) ? clean(v[0], ctx, depth + 1, refStack) : clean(v, ctx, depth + 1, refStack);
         break;
       case "anyOf":
       case "oneOf": {
         if (!Array.isArray(v)) break;
         const opts = v
           .filter((o) => !(isObj(o) && o.type === "null"))
-          .map((o) => clean(o, root, depth + 1, refStack));
+          .map((o) => clean(o, ctx, depth + 1, refStack));
         // `X | null` collapses to X.
         if (opts.length === 1) Object.assign(out, opts[0]);
         else if (opts.length > 1) out.anyOf = opts;
@@ -113,9 +136,10 @@ function clean(node: unknown, root: Schema, depth: number, refStack: string[]): 
         if (typeof v === "boolean") out.additionalProperties = v;
         break;
       default:
-        out[k] = v;
+        if (PASSTHROUGH_KEYS.has(k)) out[k] = v;
     }
   }
+  if (out.enum && out.type === undefined && !out.anyOf) out.type = "string";
 
   // Infer a missing type where it is unambiguous.
   if (out.type === undefined && !out.anyOf) {
@@ -123,7 +147,9 @@ function clean(node: unknown, root: Schema, depth: number, refStack: string[]): 
     else if (out.items) out.type = "array";
   }
   if (out.type === "array" && !out.items) out.items = {};
-  if (Array.isArray(out.required)) {
+  if (out.required !== undefined) {
+    // Non-array `required` (draft-3 per-property `required: true`) is invalid
+    // JSON Schema to every provider — asStrings() yields [] and it is dropped.
     const props = isObj(out.properties) ? out.properties : {};
     const req = asStrings(out.required).filter((r) => r in props);
     if (req.length > 0) out.required = Array.from(new Set(req));
@@ -144,10 +170,25 @@ function asStrings(v: unknown): string[] {
 /** Always returns a top-level `{type:"object", properties:{…}}` schema. */
 export function sanitizeInputSchema(schema: unknown): Record<string, unknown> {
   const root = isObj(schema) ? schema : {};
-  const cleaned = clean(root, root, 0, []);
-  return {
-    ...cleaned,
-    type: "object",
-    properties: isObj(cleaned.properties) ? cleaned.properties : {},
-  };
+  const cleaned = clean(root, { root, nodes: 0 }, 0, []);
+  const properties: Schema = isObj(cleaned.properties) ? { ...cleaned.properties } : {};
+  // Anthropic rejects anyOf/oneOf/allOf at the top level of input_schema
+  // ("does not support oneOf, allOf, or anyOf at the top level"). A root
+  // union of object variants becomes one object with every variant's
+  // properties, none required.
+  if (Array.isArray(cleaned.anyOf)) {
+    for (const opt of cleaned.anyOf as unknown[]) {
+      if (isObj(opt) && isObj(opt.properties)) {
+        for (const [k, v] of Object.entries(opt.properties)) if (!(k in properties)) properties[k] = v;
+      }
+    }
+  }
+  const { anyOf: _rootUnion, ...rest } = cleaned;
+  const out: Schema = { ...rest, type: "object", properties };
+  if (Array.isArray(out.required)) {
+    const req = asStrings(out.required).filter((r) => r in properties);
+    if (req.length > 0) out.required = req;
+    else delete out.required;
+  }
+  return out;
 }
