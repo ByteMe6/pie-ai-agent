@@ -1,6 +1,6 @@
 // Service Worker — background script for Pie
 
-import { clearLlmPause, hasResumableAgentState, pauseSessionForLlmError } from "./llm-pause";
+import { clearLlmPause, hasResumableAgentState, pauseSessionWithReason } from "./llm-pause";
 import type {
   PageContent,
   ExtractedFrameContent,
@@ -101,7 +101,7 @@ import { DEEPLINK_KEY, DEEPLINK_MANAGED_SUBSCRIBE } from "@/lib/deeplink";
 import { runStartupMigrations } from "@/lib/startup-migrations";
 import { getCrossSessionPinnedTabIds } from "@/lib/sessions/pinned-tab-registry";
 import { getEffectivePinMode, getPrimaryPin } from "@/lib/sessions/pin-state";
-import { captureActivePinnedTab } from "@/lib/sessions/capture-active-pinned";
+import { captureActivePinnedTab, capturePinnedTabById } from "@/lib/sessions/capture-active-pinned";
 import { chat } from "@/lib/model-router";
 import { generateTitle, maybeUpgradeFallbackTitle, resolveTitleSentinel } from "@/lib/sessions/title-generator";
 import {
@@ -1144,7 +1144,11 @@ async function handleResumeRequest(
   // it). 'user' mode pins were chosen explicitly by the user; if the page
   // navigated, that's their decision — resume directly. 'auto' mode has no
   // pin so checkPinnedDrift would short-circuit anyway.
-  const driftEligibleMode = getEffectivePinMode(meta, agent) === "task";
+  // A task paused because its tab was closed resumes WITHOUT the drift card
+  // (whose only option is Discard): the loop tells the model the tab is gone
+  // and it can reopen the page itself.
+  const driftEligibleMode =
+    getEffectivePinMode(meta, agent) === "task" && meta.pauseReason?.kind !== "tab-closed";
   const drift = driftEligibleMode
     ? await checkPinnedDrift(meta, agent.stepIndex)
     : null;
@@ -1228,8 +1232,10 @@ async function handleResumeRequest(
     sessionId,
     // M2-U1: shared handler that also throttles lastAccessedAt bumps.
     onStepSnapshot: makeStepSnapshotHandler(sessionId),
-    onLlmPause: (info) => pauseSessionForLlmError(sessionId, info.error),
+    onLlmPause: (info) => pauseSessionWithReason(sessionId, info.reason ?? "llm-error", info.error),
     resumedAgentMessages: agent.agentMessages,
+    // A tab-closed pause was taken before that step's observation was added.
+    resumedObservationPending: meta.pauseReason?.kind === "tab-closed",
     resumedFromStep: agent.stepIndex,
     // Phase 5 — propagate prior hasImageContent flag across resume.
     resumedHasImageContent: agent.hasImageContent,
@@ -1390,6 +1396,7 @@ async function handleChatStream(
   inFlightSessionIds: Set<string>,
   keepAlive: KeepAlive,
   fallbackTitle?: string,
+  anchorTab?: { tabId: number; windowId: number },
 ) {
   const signal = abortController.signal;
   try {
@@ -1546,7 +1553,14 @@ async function handleChatStream(
     // Panel-side fire-and-forget capture (useSession.ts:783) may race with
     // this; both paths set pinMode='task', so the second write is a no-op
     // (idempotent invariant). SW-side path is the authoritative backstop.
-    await upgradeAutoToTaskAtChatStart(sessionId, captureActivePinnedTab).catch(
+    // Pin to the panel's anchor tab (captured at send, in the panel's own
+    // window). Without one (older panel) fall back to the active-tab query.
+    // With one that no longer exists, pin nothing — never "the active tab",
+    // which here means whichever window was focused last.
+    const captureTaskTab = anchorTab
+      ? () => capturePinnedTabById(anchorTab.tabId)
+      : captureActivePinnedTab;
+    await upgradeAutoToTaskAtChatStart(sessionId, captureTaskTab).catch(
       (e) => {
         console.warn(
           `[sw] upgradeAutoToTaskAtChatStart failed for session=${sessionId}:`,
@@ -1641,8 +1655,12 @@ async function handleChatStream(
       // (see makeStepSnapshotHandler). Errors caught + logged inside
       // runAgentLoop; this wrapper only does the storage calls.
       onStepSnapshot: makeStepSnapshotHandler(sessionId),
-      // LLM retries exhausted → pause (keep history, panel shows Retry).
-      onLlmPause: (info) => pauseSessionForLlmError(sessionId, info.error),
+      // LLM retries exhausted / bound tab closed → pause (keep history,
+      // panel shows the reason with Retry).
+      onLlmPause: (info) => pauseSessionWithReason(sessionId, info.reason ?? "llm-error", info.error),
+      // Startup fallback when the session has no pin: the anchor tab, never a
+      // fresh "active tab" query (the last-focused window may be another one).
+      ...(anchorTab ? { anchorTabId: anchorTab.tabId } : {}),
       // v1.5 multi-pin: replace single `pinned` with the full array.
       // synthMeta is post-upgradeAutoToTaskAtChatStart (fetched after the
       // upgrade at line 1035), so pinnedTabs[] reflects the upgraded state.
@@ -1795,6 +1813,7 @@ chrome.runtime.onConnect.addListener((port) => {
         inFlightSessionIds,
         keepAlive,
         message.fallbackTitle,
+        message.anchorTab,
       );
     } else if (message.type === "chat-abort") {
       abortRotation.current.abort();

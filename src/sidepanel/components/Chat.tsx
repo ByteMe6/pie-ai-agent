@@ -181,6 +181,7 @@ export default function Chat({
     ratelimitResumeAt,
     llmRetry,
     pauseError,
+    pauseKind,
     error,
     errorKind,
     toast,
@@ -1090,7 +1091,11 @@ After the skill completes, briefly summarize what was created (the user will see
           <div className="flex min-w-0 flex-col gap-0.5">
             <span className="caps text-warning">{t("chat.paused")}</span>
             <span className="text-fg-1">
-              {pauseError != null ? t("chat.llmPausedDescription") : t("chat.pausedDescription")}
+              {pauseError == null
+                ? t("chat.pausedDescription")
+                : pauseKind === "tab-closed"
+                  ? t("chat.tabClosedPausedDescription")
+                  : t("chat.llmPausedDescription")}
             </span>
             {pauseError != null && (
               <span className="truncate font-mono text-[10px] text-fg-3" title={pauseError}>

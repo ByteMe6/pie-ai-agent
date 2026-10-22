@@ -4,17 +4,28 @@
 import { updateSessionMeta } from "@/lib/sessions/storage";
 import type { SessionAgentState, SessionMeta } from "@/lib/sessions/types";
 
+export type PauseKind = NonNullable<SessionMeta["pauseReason"]>["kind"];
+
 /**
- * Mark the session paused and record why, so the panel shows the error with a
- * Retry button. Only an `active` session is paused — if the user already moved
- * it elsewhere (archived, deleted) the write is skipped.
+ * Mark the session paused and record why, so the panel shows the reason with
+ * a Retry button. Only an `active` session is paused — if the user already
+ * moved it elsewhere (archived, deleted) the write is skipped.
  */
-export async function pauseSessionForLlmError(sessionId: string, error: string): Promise<void> {
+export async function pauseSessionWithReason(
+  sessionId: string,
+  kind: PauseKind,
+  error: string,
+): Promise<void> {
   await updateSessionMeta(sessionId, (current) =>
     current.status === "active"
-      ? { ...current, status: "paused", pauseReason: { kind: "llm-error", error, at: Date.now() } }
+      ? { ...current, status: "paused", pauseReason: { kind, error, at: Date.now() } }
       : null,
   );
+}
+
+/** LLM retries exhausted. */
+export function pauseSessionForLlmError(sessionId: string, error: string): Promise<void> {
+  return pauseSessionWithReason(sessionId, "llm-error", error);
 }
 
 /** Back to `active`, dropping any LLM-pause reason. */

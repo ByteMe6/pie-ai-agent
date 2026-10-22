@@ -309,6 +309,7 @@ export const jaDict = {
     llmRetrying: "プロバイダーエラー、再試行中 {attempt}/{max}…",
     llmRetryingIn: "プロバイダーエラー、{seconds} 秒後に再試行 {attempt}/{max}…",
     llmPausedDescription: "モデルプロバイダーのエラーが続いたため、タスクを一時停止しました。進捗は保持されています。「再試行」で同じステップから続行するか、新しいメッセージを送信してください。",
+    tabClosedPausedDescription: "このタスクが作業していたタブが閉じられたため、別のタブに切り替えずにタスクを一時停止しました。「再試行」で続行するか（エージェントがページを開き直せます）、新しいメッセージを送信してください。",
     retry: "再試行",
     retryAria: "一時停止したタスクを同じステップから再試行",
     expandFull: "もっと表示",

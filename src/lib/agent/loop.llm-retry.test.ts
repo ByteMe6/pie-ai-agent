@@ -312,7 +312,7 @@ describe("agent loop — LLM retry", () => {
     // backoff grows and is capped at 30s
     expect(sleeps.every((ms) => ms <= 30_000)).toBe(true);
     expect(sleeps[4]).toBeGreaterThanOrEqual(15_000);
-    expect(onLlmPause).toHaveBeenCalledWith({ error: "Bad gateway", kind: "http" });
+    expect(onLlmPause).toHaveBeenCalledWith({ error: "Bad gateway", kind: "http", reason: "llm-error" });
     expect(emitted.find((m) => m.type === "agent-paused")).toMatchObject({ error: "Bad gateway", stepCount: 0 });
     expect(emitted.some((m) => m.type === "agent-done-task")).toBe(false);
     expect(emitted.some((m) => m.type === "chat-error")).toBe(false);

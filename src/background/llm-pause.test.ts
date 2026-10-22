@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { clearLlmPause, hasResumableAgentState, pauseSessionForLlmError } from "./llm-pause";
+import { clearLlmPause, hasResumableAgentState, pauseSessionForLlmError, pauseSessionWithReason } from "./llm-pause";
 import { createSession, getSessionMeta, updateSessionMeta } from "@/lib/sessions/storage";
 import type { SessionAgentState } from "@/lib/sessions/types";
 
@@ -30,6 +30,16 @@ describe("pauseSessionForLlmError", () => {
     const cleared = clearLlmPause((await getSessionMeta(meta.id))!);
     expect(cleared.status).toBe("active");
     expect("pauseReason" in cleared).toBe(false);
+  });
+});
+
+describe("pauseSessionWithReason", () => {
+  it("records a tab-closed pause", async () => {
+    const meta = await createSession();
+    await pauseSessionWithReason(meta.id, "tab-closed", "The tab this task was working in (tab 5) was closed.");
+    const after = await getSessionMeta(meta.id);
+    expect(after?.status).toBe("paused");
+    expect(after?.pauseReason).toMatchObject({ kind: "tab-closed" });
   });
 });
 
