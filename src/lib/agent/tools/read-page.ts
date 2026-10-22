@@ -89,8 +89,12 @@ function elementText(value: string): string {
  * disagree the page is mid-navigation — say so instead of letting the model
  * trust a page that is about to be replaced.
  */
-export function pageHeaderLines(info: { url: string; title: string; tabUrl: string }): string[] {
-  const lines = [`Current URL: ${info.url}`, `Page title: ${escapeUntrustedWrappers(info.title)}`];
+export function pageHeaderLines(info: { tabId?: number; url: string; title: string; tabUrl: string }): string[] {
+  const lines = [
+    ...(info.tabId !== undefined ? [`Tab: ${info.tabId}`] : []),
+    `Current URL: ${info.url}`,
+    `Page title: ${escapeUntrustedWrappers(info.title)}`,
+  ];
   if (info.tabUrl && info.url && info.tabUrl !== info.url) {
     lines.push(
       `Note: the browser reports ${info.tabUrl} but the document is still ${info.url} — ` +
@@ -107,7 +111,7 @@ function wrapPageAtlasObservation(atlas: PageAtlasState, body: string, tabUrl: s
     // Without it a stale atlas result elides down to a bare marker — every one
     // of them byte-identical — and the LLM can no longer tell which step read
     // which page, so it re-runs read_page instead of relying on history.
-    ...pageHeaderLines({ url: atlas.fingerprint.url || atlas.url, title: atlas.title, tabUrl }),
+    ...pageHeaderLines({ tabId: atlas.tabId, url: atlas.fingerprint.url || atlas.url, title: atlas.title, tabUrl }),
     ``,
     `<untrusted_page_content ${attr("tool", "read_page")} ${attr("mode", "atlas")} ${attr("atlas_id", atlas.atlasId)} ${attr("tab_id", atlas.tabId)}>`,
     body,
@@ -547,6 +551,7 @@ export const readPageTool: Tool = {
     const docInfo = topSnapshot?.op === "snapshot" ? topSnapshot : undefined;
     const headerLines = [
       ...pageHeaderLines({
+        tabId: a.tabId,
         url: docInfo?.url || topUrl,
         title: docInfo?.title ?? tab.title ?? "",
         tabUrl: tab.url ?? "",

@@ -220,7 +220,20 @@ export interface AgentLoopContext {
    * paused so the panel offers "Retry" (resume-task → same step). Headless
    * runs (schedules) leave it unset and keep the fail-the-task behaviour.
    */
-  onLlmPause?: (info: { error: string; kind?: ErrorKind }) => Promise<void>;
+  onLlmPause?: (info: { error: string; kind?: ErrorKind; reason?: "llm-error" | "tab-closed" }) => Promise<void>;
+  /**
+   * The tab the panel was on when the user pressed send (its own window).
+   * Used instead of an "active tab" query when the session has no pin at task
+   * start: in the service worker that query answers for the LAST-FOCUSED
+   * window, which may be another window the user switched to.
+   */
+  anchorTabId?: number;
+  /**
+   * Resume after a pause taken at the TOP of a step (before that step's
+   * observation was added — e.g. the bound tab was closed). The first resumed
+   * iteration then adds its observation as usual instead of skipping it.
+   */
+  resumedObservationPending?: boolean;
   /** Overrides for the LLM retry policy (tests, headless tuning). */
   llmRetryPolicy?: Partial<LlmRetryPolicy>;
   /**
@@ -1502,19 +1515,32 @@ export async function runAgentLoop(ctx: AgentLoopContext): Promise<void> {
     discard: { discardText: number; discardThinking: number },
   ): Promise<void> => {
     const error = failure.reason === "empty" ? EMPTY_COMPLETION_ERROR : failure.error;
-    if (!ctx.onLlmPause) {
-      emit(withSession({ type: "chat-error", error, kind: failure.kind }, sessionId));
-      await emitDone({
-        type: "agent-done-task",
-        success: false,
-        summary: failure.reason === "empty" ? error : `LLM stream error: ${error}`,
-        stepCount: stepIndex,
-      }, "fail");
+    if (ctx.onLlmPause) {
+      await pauseTask("llm-error", error, stepIndex, discard, failure.kind);
       return;
     }
-    // Not a terminal state: no done emit, no tombstone, no task-pin release
-    // (the pin is needed by the resumed run). Suppresses the finally's abort
-    // done as well.
+    // Headless runs (no pause hook) fail as before.
+    emit(withSession({ type: "chat-error", error, kind: failure.kind }, sessionId));
+    await emitDone({
+      type: "agent-done-task",
+      success: false,
+      summary: failure.reason === "empty" ? error : `LLM stream error: ${error}`,
+      stepCount: stepIndex,
+    }, "fail");
+  };
+
+  // Pause (not fail) an interactive task: the in-memory history becomes the
+  // resume seed, the session is marked paused with `reason`, and the panel
+  // offers Retry (resume-task). Not a terminal state: no done emit, no
+  // tombstone, no task-pin release (the resumed run needs the pin). Also
+  // suppresses the finally's abort done.
+  const pauseTask = async (
+    reason: "llm-error" | "tab-closed",
+    error: string,
+    stepIndex: number,
+    discard: { discardText: number; discardThinking: number },
+    kind?: ErrorKind,
+  ): Promise<void> => {
     doneEmitted = true;
     if (ctx.onStepSnapshot) {
       try {
@@ -1529,13 +1555,13 @@ export async function runAgentLoop(ctx: AgentLoopContext): Promise<void> {
       }
     }
     try {
-      await ctx.onLlmPause({ error, kind: failure.kind });
+      await ctx.onLlmPause?.({ error, kind, reason });
     } catch (e) {
-      console.warn(`[agent] onLlmPause failed for session=${sessionId}:`, e);
+      console.warn(`[agent] pause hook failed for session=${sessionId}:`, e);
     }
     emit(
       withSession(
-        { type: "agent-paused", error, kind: failure.kind, stepCount: stepIndex - 1, ...discard },
+        { type: "agent-paused", error, kind, reason, stepCount: stepIndex - 1, ...discard },
         sessionId,
       ),
     );
@@ -1570,7 +1596,10 @@ export async function runAgentLoop(ctx: AgentLoopContext): Promise<void> {
     // becomes the page-less NO_PAGE_SENTINEL. The agent starts regardless and
     // recovers through the existing advisory channel.
     try {
-      const tab = await queryActiveHostTab();
+      const tab =
+        ctx.anchorTabId !== undefined
+          ? await chrome.tabs.get(ctx.anchorTabId).catch(() => undefined)
+          : await queryActiveHostTab();
       ({ pinnedTabId, pinnedOrigin } = resolveStartupPin(tab));
     } catch {
       pinnedTabId = NO_PAGE_SENTINEL;
@@ -1771,7 +1800,13 @@ export async function runAgentLoop(ctx: AgentLoopContext): Promise<void> {
   // observation merge. The prior step's snapshot already contains an
   // observation in the trailing user message; merging again would
   // produce a duplicate observation and confuse the LLM.
-  let isResumedFirstIteration = !!ctx.resumedAgentMessages;
+  let isResumedFirstIteration = !!ctx.resumedAgentMessages && !ctx.resumedObservationPending;
+  // Tabs this run has seen alive. Losing one of them pauses the task (see the
+  // per-step tab check) — never a silent switch to whatever tab is active. A
+  // tab that was already gone when this run started (a resume after exactly
+  // that pause) gets the advisory notice instead, so the model can reopen it.
+  const seenAliveTabIds = new Set<number>();
+  const lastUrlByTab = new Map<number, string>();
 
   // v1.5 Task 6+7 / Issue #33 — per-iteration refreshed pinnedTabs.
   // ctx.pinnedTabs is captured at task-start and frozen inside the loop
@@ -1823,6 +1858,21 @@ export async function runAgentLoop(ctx: AgentLoopContext): Promise<void> {
     // abort exits this loop. The soft checkpoint (SOFT_STEP_BUDGET) is a
     // neutral periodic self-check, not a wrap-up signal; there is no absolute
     // step ceiling by design.
+    // The bound tab (and every other pinned tab — readFocusFromStorage has
+    // already failed over to a surviving one) is gone. Interactive tasks
+    // pause with a clear message instead of carrying on against some other
+    // tab; headless runs keep the advisory notice.
+    const pauseIfBoundTabClosed = async (stepIndex: number): Promise<boolean> => {
+      if (!ctx.onLlmPause || !seenAliveTabIds.has(pinnedTabId)) return false;
+      const lastUrl = lastUrlByTab.get(pinnedTabId);
+      await pauseTask(
+        "tab-closed",
+        `The tab this task was working in (tab ${pinnedTabId}${lastUrl ? `, ${lastUrl}` : ""}) was closed.`,
+        stepIndex,
+        { discardText: 0, discardThinking: 0 },
+      );
+      return true;
+    };
     for (let stepIndex = startStepIndex; !signal.aborted; stepIndex++) {
       lastStepIndex = stepIndex;
       if (signal.aborted) return; // → finally
@@ -1928,6 +1978,12 @@ export async function runAgentLoop(ctx: AgentLoopContext): Promise<void> {
           awaitSettle: waitForUrlSettle,
           signal,
         });
+        if (decision.kind === "notice" && decision.noticeKey === "tab-closed") {
+          if (await pauseIfBoundTabClosed(stepIndex)) return;
+        } else {
+          seenAliveTabIds.add(pinnedTabId);
+          if (currentTab.url) lastUrlByTab.set(pinnedTabId, currentTab.url);
+        }
         if (decision.kind === "notice") {
           currentUrl = decision.url || "(focused tab unavailable)";
           pageTitle = currentTab.title ?? "";
@@ -1943,6 +1999,7 @@ export async function runAgentLoop(ctx: AgentLoopContext): Promise<void> {
       } catch {
         if (signal.aborted) return;
         // chrome.tabs.get throws → the focused tab is genuinely gone.
+        if (await pauseIfBoundTabClosed(stepIndex)) return;
         currentUrl = "(focused tab unavailable)";
         pageTitle = "";
         if (lastNoticeKey !== "tab-closed") {
@@ -2006,7 +2063,11 @@ export async function runAgentLoop(ctx: AgentLoopContext): Promise<void> {
       }
 
       // Build observation text
-      let observationText = buildObservationMessage(pageTitle, currentUrl);
+      let observationText = buildObservationMessage(
+        pageTitle,
+        currentUrl,
+        pinnedTabId === NO_PAGE_SENTINEL ? undefined : pinnedTabId,
+      );
       // Advisory runtime notices (trusted block, NOT untrusted page data).
       // Navigation divergence is surfaced once per distinct change; the periodic
       // self-check checkpoint re-appears every BUDGET_NUDGE_INTERVAL steps past

@@ -351,6 +351,7 @@ export const zhTWDict = {
     llmRetrying: "模型服務出錯，正在重試 {attempt}/{max}…",
     llmRetryingIn: "模型服務出錯，{seconds} 秒後重試 {attempt}/{max}…",
     llmPausedDescription: "模型服務持續出錯，任務已暫停。進度已保留：點「重試」從同一步繼續，或直接傳送新訊息。",
+    tabClosedPausedDescription: "任務所在的分頁已關閉，任務已暫停，不會切換到其他分頁。點「重試」繼續（智慧體可重新開啟該頁面），或直接傳送新訊息。",
     retry: "重試",
     retryAria: "從同一步重試已暫停的任務",
     expandFull: "展開全文",

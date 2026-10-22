@@ -351,6 +351,7 @@ export const zhCNDict = {
     llmRetrying: "模型服务出错，正在重试 {attempt}/{max}…",
     llmRetryingIn: "模型服务出错，{seconds} 秒后重试 {attempt}/{max}…",
     llmPausedDescription: "模型服务持续出错，任务已暂停。进度已保留：点「重试」从同一步继续，或直接发送新消息。",
+    tabClosedPausedDescription: "任务所在的标签页已关闭，任务已暂停，不会切换到其他标签页。点「重试」继续（智能体可重新打开该页面），或直接发送新消息。",
     retry: "重试",
     retryAria: "从同一步重试已暂停的任务",
     expandFull: "展开全文",

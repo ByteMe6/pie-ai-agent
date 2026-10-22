@@ -56,6 +56,15 @@ export interface ChatStartMessage {
    * user message (the only case the SW triggers title generation).
    */
   fallbackTitle?: string;
+  /**
+   * The tab the task is bound to: the active tab of the panel's OWN window,
+   * captured when the user pressed send. The SW pins the task to it instead
+   * of asking Chrome for "the active tab" — in a service worker that means
+   * the last-focused window, so a user who sends and immediately switches to
+   * another window or workspace used to get the task bound to a tab there.
+   * Optional / additive: older panels omit it and the SW falls back.
+   */
+  anchorTab?: { tabId: number; windowId: number };
 }
 
 export interface ChatAbortMessage {
@@ -213,6 +222,8 @@ export interface AgentPausedMessage {
   error: string;
   kind?: ErrorKind;
   stepCount: number;
+  /** Why: LLM retries ran out (default) or the task's tab was closed. */
+  reason?: "llm-error" | "tab-closed";
   /** Same as ChatLlmRetryMessage: the last failed attempt's partial output. */
   discardText: number;
   discardThinking: number;
