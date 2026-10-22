@@ -113,6 +113,10 @@ export type ProbeResult =
       html: string;
       interactiveElements: InteractiveElementSummary[];
       scrollableHints: ScrollableHint[];
+      /** The frame's own location / title at read time (the tab metadata
+       *  can lag an SPA route change). */
+      url?: string;
+      title?: string;
     }
   | {
       op: "atlas";
@@ -720,7 +724,14 @@ export function probePageInjected(params: ProbeParams): ProbeResult {
       });
     }
 
-    return { op: "snapshot", html, interactiveElements, scrollableHints };
+    return {
+      op: "snapshot",
+      html,
+      interactiveElements,
+      scrollableHints,
+      url: location.href,
+      title: document.title,
+    };
   }
 
   // ──────────────────────────────────────────────────────────────────────────
