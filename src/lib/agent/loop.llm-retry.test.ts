@@ -47,6 +47,8 @@ vi.mock("./tool-names", () => ({
   getToolClass: vi.fn(() => "read"),
   SCREENSHOT_TOOL_NAMES: [],
   SCREENSHOT_TOOL_NAME_SET: new Set<string>(),
+  // Vision-only tool list (used once PR #462 lands).
+  VISION_ONLY_TOOL_NAMES: [],
   // Task 7 — disclosure selectTools() resolves each tool's group via
   // getToolGroup. "core" keeps every tool selected (core is always active).
   getToolGroup: vi.fn(() => "core"),
