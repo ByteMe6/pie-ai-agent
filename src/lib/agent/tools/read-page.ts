@@ -9,6 +9,7 @@ import { renderPageAtlas } from "./page-atlas/render";
 import { executeScriptAllFrames, type AllFramesInjectionOutcome } from "../inject-all-frames";
 import { estimateTokens } from "../window-token-budget";
 import { diag, kv } from "../diag";
+import { extractPageTextInjected, type PageTextResult } from "../../dom-actions/page-text";
 
 // read_page byte budgets per mode. Default is the hard cap — don't truncate
 // by default; the LLM can still pass a smaller max_bytes to save tokens when
@@ -22,7 +23,22 @@ const MODE_BUDGETS = {
   interactive: { maxBytes: 200_000 },
   content: { maxBytes: 300_000 },
   full: { maxBytes: 500_000 },
+  // text mode is budgeted in chars via max_chars (TEXT_MAX_CHARS_*); this
+  // entry only keeps resolveHtmlBudget's per-mode lookup total.
+  text: { maxBytes: 500_000 },
 } as const;
+
+/** mode="text" char budget: default + clamp range for `max_chars`. */
+export const TEXT_MAX_CHARS_DEFAULT = 12_000;
+export const TEXT_MAX_CHARS_MIN = 500;
+export const TEXT_MAX_CHARS_MAX = 60_000;
+const TEXT_INJECT_TIMEOUT_MS = 10_000;
+
+export function resolveTextMaxChars(raw: unknown): number {
+  const n = typeof raw === "string" && raw.trim() !== "" ? Number(raw) : raw;
+  if (typeof n !== "number" || !Number.isFinite(n)) return TEXT_MAX_CHARS_DEFAULT;
+  return Math.max(TEXT_MAX_CHARS_MIN, Math.min(TEXT_MAX_CHARS_MAX, Math.floor(n)));
+}
 
 type ReadPageMode = keyof typeof MODE_BUDGETS;
 
@@ -30,10 +46,14 @@ interface ReadPageArgs {
   tabId: number;
   mode?: ReadPageMode;
   max_bytes?: number;
+  max_chars?: number;
+  scope?: "main" | "page";
 }
 
 function normalizeMode(mode: unknown): ReadPageMode {
-  return mode === "atlas" || mode === "interactive" || mode === "content" || mode === "full" ? mode : "auto";
+  return mode === "atlas" || mode === "interactive" || mode === "content" || mode === "full" || mode === "text"
+    ? mode
+    : "auto";
 }
 
 function resolveHtmlBudget(mode: ReadPageMode, rawMaxBytes: unknown): number {
@@ -102,6 +122,78 @@ export function pageHeaderLines(info: { tabId?: number; url: string; title: stri
     );
   }
   return lines;
+}
+
+/**
+ * mode="text": readable text of the top frame only. Sub-frames are not read —
+ * the observation says so when the page has any, so the model can fall back
+ * to content/atlas for iframe-hosted content.
+ */
+async function readPageText(
+  tabId: number,
+  tab: chrome.tabs.Tab,
+  maxChars: number,
+  scope: "main" | "page",
+): Promise<ActionResult> {
+  let data: PageTextResult | undefined;
+  try {
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const timeout = new Promise<"timeout">((resolve) => {
+      timer = setTimeout(() => resolve("timeout"), TEXT_INJECT_TIMEOUT_MS);
+    });
+    const injected = await Promise.race([
+      chrome.scripting.executeScript({
+        target: { tabId, frameIds: [0] },
+        func: extractPageTextInjected,
+        args: [{ maxChars, scope }],
+        // Same as the atlas/snapshot fan-out: read the current DOM, never
+        // wait for document_idle.
+        injectImmediately: true,
+      }),
+      timeout,
+    ]);
+    clearTimeout(timer);
+    if (injected === "timeout") {
+      return { success: false, error: "read_page text: page did not respond; try again in a moment" };
+    }
+    data = injected?.[0]?.result as PageTextResult | undefined;
+  } catch (e) {
+    return { success: false, error: e instanceof Error ? e.message : "executeScript failed" };
+  }
+  if (!data || typeof data.text !== "string") {
+    return { success: false, error: "read_page text: could not read the page" };
+  }
+
+  const remaining = Math.max(0, data.totalChars - data.text.length);
+  const body = data.text || "(no readable text found — the page may still be loading, or its content is in an iframe/canvas; try mode=\"interactive\" or mode=\"content\")";
+  const attrs = [attr("tool", "read_page"), attr("mode", "text"), attr("tab_id", tabId)];
+  if (data.root === "main") attrs.push(attr("root", "main"));
+  if (data.truncated) attrs.push(attr("truncated", true));
+  const lines = [
+    ...pageHeaderLines({ tabId, url: data.url || tab.url || "", title: data.title ?? tab.title ?? "", tabUrl: tab.url ?? "" }),
+    ``,
+    `<untrusted_page_content ${attrs.join(" ")}>`,
+    escapeUntrustedWrappers(body),
+    "</untrusted_page_content>",
+  ];
+  if (data.truncated) {
+    const next = Math.min(TEXT_MAX_CHARS_MAX, Math.max(maxChars * 2, maxChars + remaining));
+    lines.push(
+      maxChars >= TEXT_MAX_CHARS_MAX
+        ? `…truncated, ${remaining} more chars not shown (max_chars is already at its ${TEXT_MAX_CHARS_MAX} limit; use search_page to find specific text).`
+        : `…truncated, ${remaining} more chars not shown. To see more, call read_page again with mode="text" and max_chars=${next}.`,
+    );
+  }
+  if (data.root === "main" && scope === "main") {
+    lines.push(`(Showing the page's main content area only; pass scope="page" to include navigation and sidebars.)`);
+  }
+  const observation = lines.join("\n");
+  diag(
+    "read_page",
+    kv({ mode: "text", est: estOf(observation), chars: observation.length }),
+    kv({ textChars: data.text.length, totalChars: data.totalChars, truncated: data.truncated, root: data.root, maxChars }),
+  );
+  return { success: true, observation };
 }
 
 function wrapPageAtlasObservation(atlas: PageAtlasState, body: string, tabUrl: string): string {
@@ -261,20 +353,32 @@ function sliceUtf8(value: string, maxBytes: number): string {
 export const readPageTool: Tool = {
   name: "read_page",
   description:
-    "Inspect the given tab. Default/auto returns a compact Page Atlas for target discovery " +
-    "and structured extraction. Do not use content/full as the first inspection step. " +
+    "Inspect the given tab. To READ what a page says (assignments, articles, posts, lists of links), " +
+    "use mode=text: clean readable text with headings, lists and links as [text](url). " +
     "Use mode=interactive before click/type/select to get current element indices. " +
-    "Use content/full only as an expensive fallback after atlas/target tools are insufficient, " +
-    "or when the user explicitly asks to read or summarize full article/body text.",
+    "Default/auto returns a compact Page Atlas for target discovery and structured extraction. " +
+    "Do not use content/full as the first inspection step: they return raw HTML and are an expensive " +
+    "fallback when text/atlas/target tools are insufficient.",
   parameters: {
     type: "object",
     properties: {
       tabId: { type: "integer", description: "Tab id to read." },
       mode: {
         type: "string",
-        enum: ["auto", "atlas", "interactive", "content", "full"],
+        enum: ["auto", "atlas", "text", "interactive", "content", "full"],
         description:
-          "Read mode, each returning only its own surface. auto/atlas: page atlas. interactive: element indices only, no body text. content: body text only, no element index. full: both (most expensive). content/full are fallbacks, not first-pass inspection modes.",
+          "Read mode, each returning only its own surface. text: readable page text (headings, lists, links with URLs) — use this to read content. interactive: element indices only, no body text — use this before clicking/typing. auto/atlas: compact page atlas. content: raw body HTML, no element index. full: both index and HTML (most expensive). content/full are fallbacks, not first-pass inspection modes.",
+      },
+      max_chars: {
+        type: "integer",
+        minimum: TEXT_MAX_CHARS_MIN,
+        maximum: TEXT_MAX_CHARS_MAX,
+        description: `mode=text only: max characters of text to return (default ${TEXT_MAX_CHARS_DEFAULT}). If the result says it was truncated, call again with a larger value.`,
+      },
+      scope: {
+        type: "string",
+        enum: ["main", "page"],
+        description: "mode=text only: main (default) reads the page's main content area when it has one; page reads the whole page including navigation and sidebars.",
       },
       max_bytes: {
         type: "integer",
@@ -311,6 +415,10 @@ export const readPageTool: Tool = {
     }
     if (tab.discarded) {
       return { success: false, error: "discardedTabRequiresActivation" };
+    }
+
+    if (mode === "text") {
+      return readPageText(a.tabId, tab, resolveTextMaxChars(a.max_chars), a.scope === "page" ? "page" : "main");
     }
 
     if (mode === "atlas" || mode === "auto") {
