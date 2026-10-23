@@ -38,6 +38,7 @@ import {
 import { elideStaleObservations } from "./elide-stale-observations";
 import { applyTokenBudget, estimateTokens } from "./window-token-budget";
 import { diag, kv } from "./diag";
+import { coerceToolArgs } from "./coerce-tool-args";
 import { queryActiveHostTab } from "../panel-host/host-window";
 import { compactReactWindow, createDefaultSummarizer } from "./compact-react-window";
 import { resolveModelMeta } from "../model-router/providers/registry";
@@ -2925,8 +2926,22 @@ export async function runAgentLoop(ctx: AgentLoopContext): Promise<void> {
 
       // Process each tool call in order
       for (const tc of completedToolCalls) {
-        const args = tc.args as Record<string, unknown>;
         const tool = allTools.find((t) => t.name === tc.name);
+
+        // Weak models send wrong JSON types ("tabId":"1.04e+09", "true" for a
+        // boolean, …). Repair them against the tool's schema before anything
+        // (R7 lock, panel events, handler, history) reads the args.
+        if (tool?.parameters) {
+          const { args: fixed, coerced } = coerceToolArgs(tc.args, tool.parameters);
+          if (coerced.length > 0) {
+            tc.args = fixed;
+            for (const b of assistantBlocks) {
+              if (b.type === "tool_use" && b.id === tc.id) b.input = fixed;
+            }
+            diag("tool-args-coerced", kv({ tool: tc.name, paths: coerced.join(",") }));
+          }
+        }
+        const args = tc.args as Record<string, unknown>;
 
         if (!tool) {
           const errorMsg = `Unknown tool: ${tc.name}`;
