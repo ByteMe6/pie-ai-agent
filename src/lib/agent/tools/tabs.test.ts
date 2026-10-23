@@ -934,6 +934,14 @@ describe("navigate tool", () => {
     expect(TAB_TOOL_NAMES).toContain("navigate");
   });
 
+  it("navigates the current tab when tabId is left out", async () => {
+    const r = await navigateTool.handler({ url: "https://classroom.google.com/c/abc" }, ctx);
+    expect(r.success).toBe(true);
+    expect(tabsMock().update).toHaveBeenCalledWith(ctx.tabId, { url: "https://classroom.google.com/c/abc" });
+    const schema = navigateTool.parameters as { required?: string[] };
+    expect(schema.required).toEqual(["url"]);
+  });
+
   it("navigates to an absolute URL without `active` and waits for the page", async () => {
     const r = await navigateTool.handler({ tabId: 7, url: "https://classroom.google.com/u/0/c/xyz" }, ctx);
     expect(r.success).toBe(true);

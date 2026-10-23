@@ -1454,22 +1454,22 @@ After it returns, element indices from earlier read_page calls are invalid — c
     properties: {
       tabId: {
         type: "integer",
-        description: "Tab to navigate — must be one of this session's pinned tabs (usually your focused tab).",
+        description: "Leave out to navigate the current tab. Otherwise one of this session's pinned tabs.",
       },
       url: {
         type: "string",
         description: `Absolute http(s) URL, a URL relative to the tab's current page, or "back" / "forward". Max ${OPEN_URL_MAX_LEN} chars.`,
       },
     },
-    required: ["tabId", "url"],
+    required: ["url"],
     additionalProperties: false,
   },
   handler: async (args: unknown, ctx: ToolHandlerContext): Promise<ActionResult> => {
     const a = (args ?? {}) as { tabId?: unknown; url?: unknown };
-    if (typeof a.tabId !== "number" || !Number.isInteger(a.tabId) || a.tabId < 0) {
-      return { success: false, error: "navigate requires a numeric tabId" };
+    const tabId = typeof a.tabId === "number" ? a.tabId : ctx?.tabId;
+    if (typeof tabId !== "number" || !Number.isInteger(tabId) || tabId < 0) {
+      return { success: false, error: "navigate: no tabId given and no current tab" };
     }
-    const tabId = a.tabId;
     if (typeof a.url !== "string" || a.url.trim().length === 0) {
       return { success: false, error: "navigate: url must be a non-empty string" };
     }

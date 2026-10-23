@@ -153,6 +153,14 @@ const COMPACTION_FALLBACK_MAX_TOKENS = 32_000;
 
 /** Outbound message sink. Front-end path: `(m) => port.postMessage(m)`.
  *  Headless / scheduled path: write to Run record or discard streaming chunks. */
+
+/** The tool advertises `tabId` but doesn't require it (read_page, navigate). */
+function toolHasOptionalTabId(tool: Tool): boolean {
+  const params = tool.parameters as { properties?: Record<string, unknown>; required?: unknown } | undefined;
+  if (!params?.properties || !("tabId" in params.properties)) return false;
+  return !(Array.isArray(params.required) && params.required.includes("tabId"));
+}
+
 export type AgentEmit = (msg: PortMessageToPanel) => void;
 
 export interface AgentLoopContext {
@@ -2939,6 +2947,18 @@ export async function runAgentLoop(ctx: AgentLoopContext): Promise<void> {
               if (b.type === "tool_use" && b.id === tc.id) b.input = fixed;
             }
             diag("tool-args-coerced", kv({ tool: tc.name, paths: coerced.join(",") }));
+          }
+        }
+        // An optional tabId the model left out means "the task's current tab".
+        // Fill it in here so the R7 lock, panel and history see the real id.
+        if (tool && toolHasOptionalTabId(tool) && tc.args && typeof tc.args === "object" && !Array.isArray(tc.args)) {
+          const raw = (tc.args as Record<string, unknown>).tabId;
+          if (typeof raw !== "number" || !Number.isFinite(raw)) {
+            const filled = { ...(tc.args as Record<string, unknown>), tabId: pinnedTabId };
+            tc.args = filled;
+            for (const b of assistantBlocks) {
+              if (b.type === "tool_use" && b.id === tc.id) b.input = filled;
+            }
           }
         }
         const args = tc.args as Record<string, unknown>;

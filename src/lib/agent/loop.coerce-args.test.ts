@@ -49,6 +49,15 @@ vi.mock("./tools", () => ({
       },
       handler: (args: unknown) => probeHandler(args),
     },
+    {
+      name: "probe_opt",
+      description: "probe with optional tabId",
+      parameters: {
+        type: "object",
+        properties: { tabId: { type: "integer" }, query: { type: "string" } },
+      },
+      handler: (args: unknown) => probeHandler(args),
+    },
   ],
   getKeyboardTools: vi.fn(() => []),
   getMouseTools: vi.fn(() => []),
@@ -217,5 +226,51 @@ describe("runAgentLoop tool-arg coercion", () => {
       .flatMap((m) => (Array.isArray(m.content) ? (m.content as ContentBlock[]) : []))
       .find((b) => b.type === "tool_use");
     expect((toolUse as { input: unknown }).input).toEqual({ tabId: 1044214277, verbose: true });
+  });
+
+  async function runOne(tool: string, raw: string) {
+    let call = 0;
+    streamChatImpl.current = async function* () {
+      call++;
+      if (call === 1) {
+        yield { type: "tool-call-start", id: "call_o", index: 0, name: tool };
+        yield { type: "tool-call-delta", index: 0, argsDelta: raw };
+        yield { type: "tool-call-end", index: 0 };
+        yield { type: "done", stopReason: "tool_use", usage: { inputTokens: 1, outputTokens: 1 } };
+      } else {
+        yield { type: "text-delta", text: "all done" };
+        yield { type: "done", stopReason: "end", usage: { inputTokens: 1, outputTokens: 1 } };
+      }
+    };
+    const { runAgentLoop } = await import("./loop");
+    const emitted: Array<{ type: string; [k: string]: unknown }> = [];
+    await runAgentLoop({
+      emit: ((msg) => { emitted.push(msg as { type: string }); }) as AgentEmit,
+      task: "probe",
+      modelConfig: { provider: "openai", model: "gpt-4o", apiKey: "sk-test", vision: false },
+      signal: new AbortController().signal,
+      sessionId: "test-coerce-opt",
+      pinnedTabs: [{ tabId: 7, origin: "https://example.com" }],
+      initialFocusTabId: 7,
+      onStepSnapshot: async () => {},
+    });
+    return emitted;
+  }
+
+  it("fills a left-out optional tabId with the task's current tab", async () => {
+    const emitted = await runOne("probe_opt", '{"query":"§"}');
+    expect(probeHandler.mock.calls[0][0]).toEqual({ query: "§", tabId: 7 });
+    const step = emitted.find((m) => m.type === "agent-step" && m.tool === "probe_opt");
+    expect(step?.args).toEqual({ query: "§", tabId: 7 });
+  });
+
+  it("keeps an explicit optional tabId", async () => {
+    await runOne("probe_opt", '{"tabId":3}');
+    expect(probeHandler.mock.calls[0][0]).toEqual({ tabId: 3 });
+  });
+
+  it("does not invent a tabId for tools that require one", async () => {
+    await runOne("probe_tab", '{"verbose":true}');
+    expect(probeHandler.mock.calls[0][0]).toEqual({ verbose: true });
   });
 });
