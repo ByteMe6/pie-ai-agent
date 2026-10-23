@@ -1057,7 +1057,7 @@ export function resolveFocusedPin(
  * on resume and not on iterations > startStepIndex).
  */
 export function buildFirstTurnReadPageHint(pinnedTabId: number): string {
-  return `You haven't called read_page yet. If the task involves the active page, call read_page({tabId: ${pinnedTabId}}) first to get element indices and frame versions.`;
+  return `You haven't called read_page yet. If the task involves the active page, call read_page({tabId: ${pinnedTabId}}) first to read it (add mode:"interactive" for element indices to click/type).`;
 }
 
 /**

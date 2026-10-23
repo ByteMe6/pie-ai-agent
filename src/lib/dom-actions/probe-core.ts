@@ -445,6 +445,16 @@ export function probePageInjected(params: ProbeParams): ProbeResult {
     const input = target instanceof HTMLInputElement ? target : null;
     const option = target instanceof HTMLOptionElement ? target : null;
     const pieIdx = Number(el.getAttribute("data-pie-idx") ?? "-1");
+    let inViewport = false;
+    try {
+      const r = el.getBoundingClientRect();
+      const vh = window.innerHeight || document.documentElement.clientHeight || 0;
+      const vw = window.innerWidth || document.documentElement.clientWidth || 0;
+      inViewport = r.width > 0 && r.height > 0 && r.bottom > 0 && r.right > 0 && r.top < vh && r.left < vw;
+    } catch {
+      inViewport = false;
+    }
+    const href = tag === "a" ? normalizeSpace(target.getAttribute("href") ?? "").slice(0, 200) : "";
     return {
       pieIdx,
       tag,
@@ -461,6 +471,8 @@ export function probePageInjected(params: ProbeParams): ProbeResult {
       selected: option ? option.selected : target.hasAttribute("selected"),
       hasPopup: normalizeSpace(target.getAttribute("aria-haspopup") ?? ""),
       ariaExpanded: normalizeSpace(target.getAttribute("aria-expanded") ?? ""),
+      ...(href ? { href } : {}),
+      inViewport,
     };
   }
 

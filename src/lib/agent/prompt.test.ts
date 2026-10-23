@@ -512,9 +512,12 @@ describe("Page tools locator guidance (#113)", () => {
     expect(prompt).toContain("max_bytes");
     expect(prompt).toContain("<interactive_index>");
     expect(prompt).toContain("<untrusted_page_content>");
-    expect(prompt).toMatch(/defaults to `mode:"atlas"`/);
-    expect(prompt).toMatch(/Do not call `mode:"content"` or `mode:"full"` as the first inspection step/);
-    expect(prompt).toMatch(/mode:"content".*expensive fallback/is);
+    expect(prompt).toMatch(/defaults to `mode:"text"`/);
+    expect(prompt).toMatch(/`mode:"html"`\) is a last resort, never a first inspection step/);
+    expect(prompt).toMatch(/mode:"html".*expensive last-resort fallback/is);
+    expect(prompt).toMatch(/mode:"content"` is now just an alias of `text`/);
+    expect(prompt).toContain('offset:B})');
+    expect(prompt).toContain('query:"§|paragraph|read"');
     expect(prompt).not.toContain("interactive elements stamped `data-pie-idx=\"N\"`");
   });
 
