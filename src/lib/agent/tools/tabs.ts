@@ -2,7 +2,8 @@ import type { ActionResult } from "../../dom-actions/types";
 import type { ConfirmedTabTarget, Tool, ToolHandlerContext } from "../types";
 import { escapeUntrustedWrappers, escapeWrapperAttribute } from "../untrusted-wrappers";
 import { waitForUrlSettle } from "../wait-for-url-settle";
-import { waitForPageReady } from "../wait-for-settle";
+import { invalidateElementIndices, waitForPageReady } from "../wait-for-settle";
+import { pageAtlasStore } from "./page-atlas/state";
 import { excludePanelTabs, queryHostWindowTabs } from "../../panel-host/host-window";
 import { TAB_GROUP_TIMEOUT_MS, withHangGuard } from "./hang-guard";
 import { isOwnPanelUrl } from "../../panel-host/panel-page";
@@ -1366,6 +1367,224 @@ USE WHEN:
 
 export { switchToNewTabTool };
 
+// ── navigate — load a URL in an existing (pinned) tab ────────────────────────
+
+const NAVIGATE_COMMIT_TIMEOUT_MS = 5000;
+const NAVIGATE_READY_BUDGET_MS = 10_000;
+const NAVIGATE_URL_DISPLAY_MAX = 300;
+
+/** Page-derived URL → single-line, truncated, wrapper-escaped display string. */
+function sanitizeUrlForObservation(url: string): string {
+  let cleaned = url.replace(LINE_BREAK_RE, " ").replace(CONTROL_CHARS_RE, "");
+  if (cleaned.length > NAVIGATE_URL_DISPLAY_MAX) {
+    cleaned = cleaned.slice(0, NAVIGATE_URL_DISPLAY_MAX) + "…";
+  }
+  return escapeUntrustedWrappers(cleaned);
+}
+
+/**
+ * Resolve once the tab's top frame commits a navigation (cross-document
+ * commit, SPA history update or fragment change), or after `timeoutMs`.
+ * Listeners are attached synchronously, BEFORE the caller triggers the
+ * navigation, so the commit can't be missed. Without this gate
+ * waitForPageReady would probe the OLD (already settled) document and return
+ * immediately.
+ */
+function watchTopFrameCommit(tabId: number, timeoutMs: number): {
+  committed: Promise<boolean>;
+  cancel: () => void;
+} {
+  const wn = chrome.webNavigation;
+  const events = [wn?.onCommitted, wn?.onHistoryStateUpdated, wn?.onReferenceFragmentUpdated].filter(
+    (e): e is NonNullable<typeof e> => !!e && typeof e.addListener === "function",
+  );
+  let done: (v: boolean) => void = () => {};
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const listener = (d: { tabId: number; frameId: number }) => {
+    if (d.tabId === tabId && d.frameId === 0) finish(true);
+  };
+  const finish = (v: boolean) => {
+    if (timer !== undefined) clearTimeout(timer);
+    timer = undefined;
+    for (const e of events) e.removeListener(listener);
+    done(v);
+  };
+  const committed = new Promise<boolean>((resolve) => {
+    done = resolve;
+  });
+  for (const e of events) e.addListener(listener);
+  timer = setTimeout(() => finish(false), timeoutMs);
+  return { committed, cancel: () => finish(false) };
+}
+
+/**
+ * navigate — load a URL (absolute, relative, or history back/forward) in an
+ * EXISTING tab the session already owns. The simple "go there in my current
+ * tab" primitive: no new tab, no new tab id to track, no focus change.
+ *
+ * Security / UX invariants:
+ *   - http(s) only after resolution; javascript:/data:/file:/chrome:/… rejected.
+ *   - chrome.tabs.update(tabId, { url }) WITHOUT `active` — never steals the
+ *     user's view or focuses a window.
+ *   - Target must be one of the session's pinned tabs (or ctx.tabId when the
+ *     harness carries no pin list) — the agent can't hijack arbitrary tabs.
+ *     Class = write, so the R7 cross-session lock checks args.tabId.
+ *   - After the page is ready, the tab's Page Atlas entries and data-pie-idx
+ *     stamps are dropped: indices from earlier reads must not resolve on the
+ *     new page.
+ *
+ * The pin's recorded origin is NOT rewritten on a cross-origin navigate; the
+ * loop's advisory origin re-check surfaces that as a <system_notice> (same as
+ * a cross-origin link click), which the observation pre-empts.
+ */
+const navigateTool: Tool = {
+  name: "navigate",
+  description:
+    `Go to a URL in an existing tab (normally your focused tab) — like typing in the address bar. The tab id stays the same; no new tab is opened. \`url\` may be absolute (https://…), relative to the tab's current page (e.g. "/c/123", "?page=2"), or "back" / "forward" for browser history. http/https only.
+
+USE WHEN:
+- You know (or can read from the page) the URL you want and just need to go there in the current tab — prefer this over clicking a link by a possibly-stale index, and over opening many tabs with open_url.
+
+**DO NOT USE WHEN:**
+- You need the current page to stay open alongside the new one — use open_url.
+
+After it returns, element indices from earlier read_page calls are invalid — call read_page again.`,
+  parameters: {
+    type: "object",
+    properties: {
+      tabId: {
+        type: "integer",
+        description: "Tab to navigate — must be one of this session's pinned tabs (usually your focused tab).",
+      },
+      url: {
+        type: "string",
+        description: `Absolute http(s) URL, a URL relative to the tab's current page, or "back" / "forward". Max ${OPEN_URL_MAX_LEN} chars.`,
+      },
+    },
+    required: ["tabId", "url"],
+    additionalProperties: false,
+  },
+  handler: async (args: unknown, ctx: ToolHandlerContext): Promise<ActionResult> => {
+    const a = (args ?? {}) as { tabId?: unknown; url?: unknown };
+    if (typeof a.tabId !== "number" || !Number.isInteger(a.tabId) || a.tabId < 0) {
+      return { success: false, error: "navigate requires a numeric tabId" };
+    }
+    const tabId = a.tabId;
+    if (typeof a.url !== "string" || a.url.trim().length === 0) {
+      return { success: false, error: "navigate: url must be a non-empty string" };
+    }
+    const rawUrl = a.url.trim();
+    if (rawUrl.length > OPEN_URL_MAX_LEN) {
+      return { success: false, error: `navigate: url-too-long (>${OPEN_URL_MAX_LEN} chars)` };
+    }
+
+    // Target gate: only tabs this session owns.
+    const pins = ctx.pinnedTabs ?? [];
+    const allowed = pins.length > 0 ? pins.some((p) => p.tabId === tabId) : tabId === ctx.tabId;
+    if (!allowed) {
+      const ids = pins.length > 0 ? pins.map((p) => p.tabId).join(", ") : String(ctx.tabId);
+      return {
+        success: false,
+        error:
+          `navigate: tab ${tabId} is not one of this session's tabs (yours: [${ids}]; focused: ${ctx.tabId}). ` +
+          `Navigate your focused tab ${ctx.tabId}, or use open_url to open a new tab.`,
+      };
+    }
+
+    let before: chrome.tabs.Tab;
+    try {
+      before = await chrome.tabs.get(tabId);
+    } catch {
+      return { success: false, error: `navigate: tab ${tabId} not found (closed?)` };
+    }
+
+    const lower = rawUrl.toLowerCase();
+    const history = lower === "back" || lower === "forward" ? lower : null;
+    let target: string | null = null;
+    if (!history) {
+      let parsed: URL;
+      try {
+        parsed = before.url ? new URL(rawUrl, before.url) : new URL(rawUrl);
+      } catch {
+        return {
+          success: false,
+          error: `navigate: invalid URL "${sanitizeUrlForObservation(rawUrl)}" (use an absolute https:// URL, a path relative to the current page, or "back"/"forward")`,
+        };
+      }
+      if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
+        return {
+          success: false,
+          error: `navigate: unsafe-url-scheme "${parsed.protocol}" (only http: and https: are allowed)`,
+        };
+      }
+      target = parsed.href;
+    }
+
+    const startedAt = Date.now();
+    const watch = watchTopFrameCommit(tabId, NAVIGATE_COMMIT_TIMEOUT_MS);
+    try {
+      if (history === "back") await chrome.tabs.goBack(tabId);
+      else if (history === "forward") await chrome.tabs.goForward(tabId);
+      // No `active` — never steal the user's view / focus a window.
+      else await chrome.tabs.update(tabId, { url: target! });
+    } catch (e) {
+      watch.cancel();
+      const msg = e instanceof Error ? e.message : String(e);
+      return {
+        success: false,
+        error: history
+          ? `navigate: cannot go ${history} in tab ${tabId} (${msg}) — there may be no ${history} history entry.`
+          : `navigate: chrome.tabs.update failed — ${msg}`,
+      };
+    }
+    const committed = await watch.committed;
+
+    const ready = await waitForPageReady(tabId, { deadline: startedAt + NAVIGATE_READY_BUDGET_MS });
+    // Whatever happened, earlier indices / atlases must not survive.
+    pageAtlasStore.invalidateTab(tabId);
+    await invalidateElementIndices(tabId);
+
+    let after: chrome.tabs.Tab | undefined;
+    try {
+      after = await chrome.tabs.get(tabId);
+    } catch {
+      return { success: false, error: `navigate: tab ${tabId} disappeared during navigation` };
+    }
+    const finalUrl = after.url || after.pendingUrl || target || "";
+    const title = sanitizeTabTitle(after.title);
+
+    const notes: string[] = [];
+    if (!committed) {
+      notes.push(
+        history
+          ? ` No navigation was detected — there may be no ${history} history entry.`
+          : " No navigation was detected within 5s — the page may be unchanged; check with read_page.",
+      );
+    }
+    if (!ready.ready && ready.reason !== "unreachable") {
+      notes.push(" The page was still loading after 10s — read_page may show a partial page.");
+    }
+    const prevOrigin = parseTabOrigin(before.url);
+    const newOrigin = parseTabOrigin(finalUrl);
+    if (prevOrigin && newOrigin && prevOrigin !== newOrigin) {
+      notes.push(
+        ` The site changed (${prevOrigin} → ${newOrigin}); a system notice about the origin change is expected — continue.`,
+      );
+    }
+
+    return {
+      success: true,
+      observation:
+        `Navigated tab ${tabId} to ${sanitizeUrlForObservation(finalUrl)} — ` +
+        `<untrusted_tab_metadata>${title}</untrusted_tab_metadata>. ` +
+        `Element indices from earlier reads are no longer valid; call read_page (mode=text to read, mode=interactive to act).` +
+        notes.join(""),
+    };
+  },
+};
+
+export { navigateTool };
+
 export const TAB_TOOLS: Tool[] = [
   listTabsTool,
   closeTabsTool,
@@ -1376,5 +1595,6 @@ export const TAB_TOOLS: Tool[] = [
   focusTabTool,
   unpinTabTool,
   openUrlTool,
+  navigateTool,
   switchToNewTabTool,
 ];

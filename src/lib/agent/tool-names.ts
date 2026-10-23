@@ -69,6 +69,7 @@ export const TAB_TOOL_NAMES = [
   "move_tabs",
   "focus_tab", // v1.5 multi-pin
   "open_url",  // v1.5
+  "navigate",  // load a URL / back / forward in an existing pinned tab (same tab id)
   "unpin_tab", // Issue #110 — remove a tab from session pins so it can be closed
   "switch_to_new_tab", // v1.1 cross-tab replay
 ] as const;
@@ -265,6 +266,7 @@ export const TOOL_CLASSES: Readonly<Record<string, ToolClass>> = {
   move_tabs: "write",
   focus_tab: "read", // mutates only internal session pointer, no tab state change
   open_url: "write", // creates a new tab; mutates browser state
+  navigate: "write", // replaces the page in an existing tab; R7 lock checks args.tabId
   unpin_tab: "read", // Issue #110 — removes a session pin; no tab/page state change
   switch_to_new_tab: "read", // adopts a child tab this session spawned + sets focus; no page mutation
 
@@ -380,7 +382,7 @@ export const TOOL_GROUPS: Readonly<Record<string, DisclosureGroup>> = {
   extract_records: "core",
   list_tabs: "core", close_tabs: "core", activate_tab: "core", group_tabs: "core",
   ungroup_tabs: "core", move_tabs: "core", focus_tab: "core", open_url: "core",
-  unpin_tab: "core", switch_to_new_tab: "core",
+  navigate: "core", unpin_tab: "core", switch_to_new_tab: "core",
   search_web: "core",
   output_file: "core",
   dispatch_keyboard_input: "core", press_key: "core",
