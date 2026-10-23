@@ -150,7 +150,7 @@ const SEARCH_TOOL_GUIDANCE = `
 **Drill-down protocol** (the critical discipline):
 1. Read all snippets in the \`<untrusted_search_result>\` observation.
 2. Pick 1–3 promising URLs (recent, authoritative, on-topic).
-3. \`open_url\` each — they auto-pin as new tabs.
+3. \`open_url({url, new_tab: true})\` each — they open as new pinned tabs.
 4. Next iteration: \`read_page({tabId: N})\` on each new tab id for its text.
 5. Synthesize across sources and cite URLs in your answer.
 
@@ -173,8 +173,8 @@ Tab management tools (list_tabs, close_tabs, activate_tab, group_tabs, ungroup_t
 - \`list_tabs\` defaults to \`scope=currentWindow\`; pass \`scope=allWindows\` only when explicitly needed.
 - \`close_tabs\` / \`group_tabs\` / \`ungroup_tabs\` / \`move_tabs\` accept arrays — batch into ONE call, don't loop per tab id.
 - \`activate_tab\` foregrounds a tab but does NOT change the agent's pinned tab — click/type still target the original pin.
-- \`navigate({url})\` loads a URL in your current tab (same tab id, no new tab; pass tabId only for another pinned tab): absolute, relative to the current page, or "back"/"forward". Prefer it over open_url when you just want to go somewhere in your focused tab; re-read the page afterwards.
-- \`open_url(url, active?)\` opens a new tab (http/https only; other schemes are rejected). It auto-joins your pinned tab list; call \`focus_tab(newTabId)\` next iteration to operate on it. Pass \`active=true\` only if the user wants it foregrounded.
+- \`navigate({url})\` loads a URL in your current tab (same tab id, no new tab; pass tabId only for another pinned tab): absolute, relative to the current page, or "back"/"forward". Re-read the page afterwards.
+- \`open_url({url})\` goes to a URL in your current tab, like \`navigate\` (http/https only; relative URLs resolve against the current page). Pass \`new_tab: true\` only when you must keep the current page open too — the new tab joins your pinned tabs and becomes your focused tab.
 - \`close_tabs\` **cannot** close a tab that is pinned to this conversation. To close one you opened (e.g. via \`open_url\`) and no longer need: call \`unpin_tab(id)\` first to release the pin, then \`close_tabs([id])\`. User-pinned tabs can only be released from the PINNED dropdown — ask the user instead of trying to unpin them.
 - A \`click\` (or Enter keypress) can open a **new tab** — a \`target="_blank"\` link, a \`window.open\` popup. When it does, the tool's observation reports the new tab id; call \`switch_to_new_tab\` to adopt and focus it, then \`read_page\`/\`click\` there on the NEXT iteration. If the observation says nothing about a new tab, none opened — don't guess one did.
 
@@ -264,7 +264,7 @@ const READ_PAGE_GUIDANCE = `
 - Looking for something specific (a paragraph number, a due date, a name)? Use \`query\` instead of paging: \`read_page({query:"§|paragraph|read"})\` returns only the matching lines (\`|\` separates alternatives).
 - To click / type / select, first call \`read_page({mode:"interactive"})\`: it lists numbered elements (on-screen first; add \`query\` to filter). Pass the \`frameId\` and \`elementIndex\` from the most recent read; re-read after **"Element not found"** (the page changed).
 - Tables and lists to extract as records: \`read_page({mode:"atlas"})\` gives target ids — search them with \`find_target\`, then read a \`collection\` / \`table\` with \`read_struct\` (pass \`fields\` to keep only some) or a \`region\` / \`detail_region\` with \`read_target\`. The atlas lists only the most relevant entries; \`<omitted …/>\` means more exist.
-- "(Unchanged since your previous read_page of this page.)" means nothing changed — use what you already have. To follow a link, go to its URL (\`navigate\`, or \`open_url\` for a new tab).`;
+- "(Unchanged since your previous read_page of this page.)" means nothing changed — use what you already have. To follow a link, go to its URL (\`navigate\` / \`open_url\`; \`open_url\` with \`new_tab: true\` for a new tab).`;
 
 const FRAME_AWARENESS_GUIDANCE = `
 

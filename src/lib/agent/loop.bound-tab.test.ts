@@ -285,7 +285,7 @@ describe("agent loop — bound tab vs. the user's window focus", () => {
     expect(readPageCalls).toEqual([TAB_A.id, TAB_A.id]);
   });
 
-  it("does not steal focus: no tabs.update / windows.update", async () => {
+  it("bound tab already active in its window: no tabs.update, never windows.update", async () => {
     const { runAgentLoop } = await import("./loop");
     const g = globalThis as unknown as { chrome: { tabs: Record<string, unknown>; windows: Record<string, unknown> } };
     g.chrome.tabs.update = vi.fn();
@@ -298,6 +298,52 @@ describe("agent loop — bound tab vs. the user's window focus", () => {
     expect(g.chrome.windows.update).not.toHaveBeenCalled();
     delete g.chrome.tabs.update;
     delete g.chrome.windows.update;
+  });
+
+  it("bound tab in the background of its window → activated (tab-level only), user's tab B untouched", async () => {
+    const { runAgentLoop } = await import("./loop");
+    // Window 1: the user moved on to A2, so A is a background tab there.
+    // Window 2 (focused): tab B.
+    const A2: FakeTab = { id: 103, windowId: 1, active: true, url: "https://news.example/", title: "News" };
+    browser.tabs = [{ ...TAB_A, active: false }, A2, { ...TAB_B }];
+    const g = globalThis as unknown as { chrome: { tabs: Record<string, unknown>; windows: Record<string, unknown> } };
+    const tabsUpdate = vi.fn(async (id: number, props: { active?: boolean }) => {
+      if (props.active) {
+        const t = browser.tabs.find((x) => x.id === id)!;
+        for (const o of browser.tabs) if (o.windowId === t.windowId) o.active = o.id === id;
+      }
+      return {};
+    });
+    g.chrome.tabs.update = tabsUpdate;
+    g.chrome.windows.update = vi.fn();
+    turns.push(readPageTurn("t1"), readPageTurn("t2"), answerTurn);
+    const { ctx } = makeCtx({ anchorTabId: TAB_A.id });
+    browser.focusedWindowId = 2;
+    await runAgentLoop(ctx);
+
+    expect(readPageCalls).toEqual([TAB_A.id, TAB_A.id]);
+    // activated once (second step re-checks and finds A active)
+    expect(tabsUpdate).toHaveBeenCalledTimes(1);
+    expect(tabsUpdate).toHaveBeenCalledWith(TAB_A.id, { active: true });
+    expect(tabsUpdate.mock.calls.some((c) => c[0] === TAB_B.id)).toBe(false);
+    expect(g.chrome.windows.update).not.toHaveBeenCalled();
+    expect(browser.focusedWindowId).toBe(2);
+    expect(browser.tabs.find((t) => t.id === TAB_B.id)!.active).toBe(true);
+    delete g.chrome.tabs.update;
+    delete g.chrome.windows.update;
+  });
+
+  it("activation failure does not fail the tool", async () => {
+    const { runAgentLoop } = await import("./loop");
+    browser.tabs = [{ ...TAB_A, active: false }, { ...TAB_B }];
+    const g = globalThis as unknown as { chrome: { tabs: Record<string, unknown> } };
+    g.chrome.tabs.update = vi.fn(async () => { throw new Error("Tabs cannot be edited right now"); });
+    turns.push(readPageTurn("t1"), answerTurn);
+    const { ctx, emitted } = makeCtx({ anchorTabId: TAB_A.id });
+    await runAgentLoop(ctx);
+    expect(readPageCalls).toEqual([TAB_A.id]);
+    expect(emitted.some((m) => m.type === "agent-step" && m.tool === "read_page" && m.status === "error")).toBe(false);
+    delete g.chrome.tabs.update;
   });
 
   it("bound tab closed → pauses with a clear message, never reads another tab", async () => {

@@ -1,4 +1,4 @@
-import type { AgentMessage, ContentBlock, ToolDefinition, StreamEvent, ErrorKind } from "../model-router/types";
+import type { AgentMessage, ContentBlock, StreamEvent, ErrorKind } from "../model-router/types";
 import {
   DEFAULT_LLM_RETRY_POLICY,
   EMPTY_RESPONSE_NUDGE,
@@ -39,6 +39,7 @@ import { elideStaleObservations } from "./elide-stale-observations";
 import { applyTokenBudget, estimateTokens } from "./window-token-budget";
 import { diag, kv } from "./diag";
 import { coerceToolArgs } from "./coerce-tool-args";
+import { toolsToWireDefinitions, toolTakesTabId, toolNeedsActiveTab, createTabActivator } from "./tab-targeting";
 import { queryActiveHostTab } from "../panel-host/host-window";
 import { compactReactWindow, createDefaultSummarizer } from "./compact-react-window";
 import { resolveModelMeta } from "../model-router/providers/registry";
@@ -153,13 +154,6 @@ const COMPACTION_FALLBACK_MAX_TOKENS = 32_000;
 
 /** Outbound message sink. Front-end path: `(m) => port.postMessage(m)`.
  *  Headless / scheduled path: write to Run record or discard streaming chunks. */
-
-/** The tool advertises `tabId` but doesn't require it (read_page, navigate). */
-function toolHasOptionalTabId(tool: Tool): boolean {
-  const params = tool.parameters as { properties?: Record<string, unknown>; required?: unknown } | undefined;
-  if (!params?.properties || !("tabId" in params.properties)) return false;
-  return !(Array.isArray(params.required) && params.required.includes("tabId"));
-}
 
 export type AgentEmit = (msg: PortMessageToPanel) => void;
 
@@ -424,14 +418,6 @@ export function chatMessageToAgentMessage(
   }
   if (wrappedText) blocks.push({ type: "text", text: wrappedText });
   return { role: "user", content: blocks };
-}
-
-function toolsToDefinitions(tools: Tool[]): ToolDefinition[] {
-  return tools.map((t) => ({
-    name: t.name,
-    description: t.description,
-    parameters: t.parameters,
-  }));
 }
 
 const VISION_ONLY_TOOL_NAME_SET = new Set<string>(VISION_ONLY_TOOL_NAMES);
@@ -1630,6 +1616,7 @@ export async function runAgentLoop(ctx: AgentLoopContext): Promise<void> {
   // depends on it. v1.5.1 backlog: refresh ownerToken on focus_tab as
   // defense-in-depth.
   ownerToken = { sessionId, tabId: pinnedTabId };
+  const ensureTabActive = createTabActivator(sessionId);
 
   // Curried CdpSession factory — passed to keyboard tools via closure.
   // INVARIANT: defined ONCE here, BEFORE the for-loop, so all per-iteration
@@ -2377,7 +2364,7 @@ export async function runAgentLoop(ctx: AgentLoopContext): Promise<void> {
       const allTools = excludeSet
         ? allToolsBeforeExclude.filter((t) => !excludeSet.has(t.name))
         : allToolsBeforeExclude;
-      const toolDefinitions = toolsToDefinitions(allTools);
+      const toolDefinitions = toolsToWireDefinitions(allTools);
 
       // Stream from LLM. One request per attempt; transient failures (429 /
       // 5xx / network / timeout / empty completion) are retried with
@@ -2949,9 +2936,11 @@ export async function runAgentLoop(ctx: AgentLoopContext): Promise<void> {
             diag("tool-args-coerced", kv({ tool: tc.name, paths: coerced.join(",") }));
           }
         }
-        // An optional tabId the model left out means "the task's current tab".
-        // Fill it in here so the R7 lock, panel and history see the real id.
-        if (tool && toolHasOptionalTabId(tool) && tc.args && typeof tc.args === "object" && !Array.isArray(tc.args)) {
+        // tabId is optional for the model on every built-in tool (the wire
+        // schema drops it from `required`); left out / non-numeric means "the
+        // task's current tab". Fill it in here so the R7 lock, panel, handler
+        // and history all see the real id. MCP tools are not touched.
+        if (tool && toolTakesTabId(tool) && tc.args && typeof tc.args === "object" && !Array.isArray(tc.args)) {
           const raw = (tc.args as Record<string, unknown>).tabId;
           if (typeof raw !== "number" || !Number.isFinite(raw)) {
             const filled = { ...(tc.args as Record<string, unknown>), tabId: pinnedTabId };
@@ -3065,6 +3054,15 @@ export async function runAgentLoop(ctx: AgentLoopContext): Promise<void> {
           resolvedElement,
           status: "pending",
         });
+
+        // The tab a page tool works in must be the active tab of ITS window —
+        // background tabs don't render lazy-loaded SPA content. Tab-level only
+        // (never windows.update / focused), so the user's focus elsewhere is
+        // left alone. Failure never fails the tool.
+        if (toolNeedsActiveTab(tc.name)) {
+          const target = typeof args?.tabId === "number" && toolTakesTabId(tool) ? args.tabId : pinnedTabId;
+          if (target !== NO_PAGE_SENTINEL) await ensureTabActive(target);
+        }
 
         // Screenshot tool dispatch (R5/R6) — direct capture without confirm.
         if (

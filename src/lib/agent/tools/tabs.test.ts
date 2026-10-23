@@ -512,7 +512,7 @@ describe("open_url tool", () => {
     expect(r.error).toMatch(/url-too-long/);
   });
 
-  it("rejects relative URL (URL constructor throws)", async () => {
+  it("rejects a relative URL when there is no current tab to resolve it against", async () => {
     const r = await openUrlTool.handler(
       { url: "/example.com" },
       { tabId: 12 },
@@ -532,7 +532,11 @@ describe("open_url tool", () => {
   function fireOnCommittedNext(tabId: number, frameId: number) {
     // Drain microtasks so the addListener call inside waitForUrlSettle
     // has executed, then fire onCommitted.
-    return new Promise<void>((resolve) => {
+    // open_url first awaits chrome.tabs.get (bound tab) and tabs.create, so
+    // drain a few microtask turns before firing.
+    return (async () => {
+      for (let i = 0; i < 20; i++) await Promise.resolve();
+    })().then(() => new Promise<void>((resolve) => {
       queueMicrotask(() => {
         const listeners = chromeMock.webNavigation.__committedListeners.slice();
         for (const l of listeners) {
@@ -546,10 +550,10 @@ describe("open_url tool", () => {
         }
         resolve();
       });
-    });
+    }));
   }
 
-  it("creates tab and pushes pin on success", async () => {
+  it("no usable current tab (ctx.tabId points at no tab) → creates an active tab and pushes pin", async () => {
     chromeMock.tabs.__tabsById.set(999, {
       id: 999,
       url: "https://example.com/page",
@@ -571,13 +575,13 @@ describe("open_url tool", () => {
         .create,
     ).toHaveBeenCalledWith({
       url: "https://example.com/page",
-      active: false,
+      active: true,
     });
     expect(append).toHaveBeenCalledWith({
       tabId: 999,
       origin: "https://example.com",
     });
-    expect(r.observation).toMatch(/Opened tab 999/);
+    expect(r.observation).toMatch(/Opened new tab 999/);
     expect(r.observation).toMatch(/focus_tab\(999\)/);
   });
 
@@ -608,30 +612,42 @@ describe("open_url tool", () => {
     }
   });
 
-  it("respects active=true", async () => {
-    chromeMock.tabs.__tabsById.set(999, {
-      id: 999,
-      url: "https://example.com/",
-    });
+  it("new_tab=true creates an ACTIVE tab, pins it and makes it the focus tab (bound tab untouched)", async () => {
+    chromeMock.tabs.__tabsById.set(12, { id: 12, url: "https://a.com/x", active: true });
+    chromeMock.tabs.__tabsById.set(999, { id: 999, url: "https://example.com/" });
+    const update = vi.fn();
+    const windowsUpdate = vi.fn();
+    Object.assign(chromeMock.tabs, { update });
+    (globalThis.chrome as unknown as { windows: unknown }).windows = { update: windowsUpdate };
     const append = vi.fn().mockResolvedValue(undefined);
+    const setFocus = vi.fn().mockResolvedValue(undefined);
     const handlerPromise = openUrlTool.handler(
-      { url: "https://example.com/", active: true },
-      {
-        tabId: 12,
-        appendPinnedTab: append,
-      },
+      { url: "https://example.com/", new_tab: true },
+      { tabId: 12, appendPinnedTab: append, setCurrentFocusTabId: setFocus },
     );
     await fireOnCommittedNext(999, 0);
     const r = await handlerPromise;
     expect(r.success).toBe(true);
     expect(
-      (chromeMock.tabs as unknown as { create: ReturnType<typeof vi.fn> })
-        .create,
-    ).toHaveBeenCalledWith({
-      url: "https://example.com/",
-      active: true,
-    });
-    expect(r.observation).toMatch(/stole user's view/);
+      (chromeMock.tabs as unknown as { create: ReturnType<typeof vi.fn> }).create,
+    ).toHaveBeenCalledWith({ url: "https://example.com/", active: true });
+    expect(append).toHaveBeenCalledWith({ tabId: 999, origin: "https://example.com" });
+    expect(setFocus).toHaveBeenCalledWith(999);
+    expect(update).not.toHaveBeenCalled();
+    expect(windowsUpdate).not.toHaveBeenCalled();
+    expect(r.observation).toMatch(/now your focused tab/);
+  });
+
+  it("new_tab=true resolves a relative URL against the current tab", async () => {
+    chromeMock.tabs.__tabsById.set(12, { id: 12, url: "https://classroom.google.com/u/1/h" });
+    chromeMock.tabs.__tabsById.set(999, { id: 999, url: "https://classroom.google.com/u/1/c/abc" });
+    const handlerPromise = openUrlTool.handler({ url: "/u/1/c/abc", new_tab: true }, { tabId: 12 });
+    await fireOnCommittedNext(999, 0);
+    const r = await handlerPromise;
+    expect(r.success).toBe(true);
+    expect(
+      (chromeMock.tabs as unknown as { create: ReturnType<typeof vi.fn> }).create,
+    ).toHaveBeenCalledWith({ url: "https://classroom.google.com/u/1/c/abc", active: true });
   });
 
   it("succeeds without appendPinnedTab writer (test/legacy harness)", async () => {
@@ -679,7 +695,7 @@ describe("open_url tool", () => {
       tabId: 999,
       origin: "https://example.com",
     });
-    expect(r.observation).toMatch(/Opened tab 999/);
+    expect(r.observation).toMatch(/Opened new tab 999/);
   });
 
   it("Issue #50 — handler fails when commit times out; appendPinnedTab is NOT called and tab is NOT removed", async () => {
@@ -1021,5 +1037,137 @@ describe("navigate tool", () => {
     const r = await navigateTool.handler({ tabId: 7, url: "https://docs.google.com/d/1" }, ctx);
     expect(r.success).toBe(true);
     expect(r.observation).toMatch(/classroom\.google\.com → https:\/\/docs\.google\.com/);
+  });
+});
+
+// ── open_url default mode — loads in the bound tab (shares navigate's core) ──
+
+describe("open_url — default: current (bound) tab", () => {
+  const ctx = { tabId: 7, pinnedTabs: [{ tabId: 7, origin: "https://classroom.google.com" }] };
+  type Mocked = { update: ReturnType<typeof vi.fn>; create: ReturnType<typeof vi.fn> };
+  const tabsMock = () => chromeMock.tabs as unknown as Mocked;
+  let executeScript: ReturnType<typeof vi.fn>;
+  let windowsUpdate: ReturnType<typeof vi.fn>;
+
+  function fireCommit(tabId: number) {
+    for (const l of chromeMock.webNavigation.__committedListeners.slice()) {
+      l({ tabId, frameId: 0, url: "x", timeStamp: Date.now(), processId: 0 } as Parameters<typeof l>[0]);
+    }
+  }
+
+  function setTab(active: boolean) {
+    chromeMock.tabs.__tabsById.set(7, {
+      id: 7,
+      url: "https://classroom.google.com/u/1/h",
+      title: "Home",
+      active,
+    } as never);
+  }
+
+  beforeEach(() => {
+    setTab(true);
+    Object.assign(chromeMock.tabs, {
+      get: vi.fn(async (id: number) => {
+        const t = chromeMock.tabs.__tabsById.get(id);
+        if (!t) throw new Error(`No tab with id ${id}`);
+        return t;
+      }),
+      update: vi.fn(async (id: number, props: { url?: string; active?: boolean }) => {
+        const cur = chromeMock.tabs.__tabsById.get(id)!;
+        chromeMock.tabs.__tabsById.set(id, { ...cur, ...props, title: props.url ? "Stream" : cur.title });
+        if (props.url) queueMicrotask(() => fireCommit(id));
+      }),
+      create: vi.fn(),
+    });
+    windowsUpdate = vi.fn();
+    (globalThis.chrome as unknown as { windows: unknown }).windows = { update: windowsUpdate };
+    executeScript = vi.fn(async () => [
+      { result: { url: "u", title: "t", heading: "h", readyState: "complete", mutAt: Date.now() - 5000, loading: false } },
+    ]);
+    (globalThis.chrome as unknown as { scripting: unknown }).scripting = { executeScript };
+  });
+
+  afterEach(() => {
+    delete (globalThis.chrome as unknown as { scripting?: unknown }).scripting;
+    delete (globalThis.chrome as unknown as { windows?: unknown }).windows;
+  });
+
+  it("navigates the bound tab with tabs.update({url}) and creates no tab", async () => {
+    const append = vi.fn();
+    const setFocus = vi.fn();
+    const r = await openUrlTool.handler(
+      { url: "https://classroom.google.com/u/1/c/abc" },
+      { ...ctx, appendPinnedTab: append, setCurrentFocusTabId: setFocus },
+    );
+    expect(r.success).toBe(true);
+    expect(tabsMock().update).toHaveBeenCalledWith(7, { url: "https://classroom.google.com/u/1/c/abc" });
+    // Already active → no extra activation call.
+    expect(tabsMock().update).toHaveBeenCalledTimes(1);
+    expect(tabsMock().create).not.toHaveBeenCalled();
+    expect(append).not.toHaveBeenCalled();
+    expect(setFocus).not.toHaveBeenCalled();
+    expect(windowsUpdate).not.toHaveBeenCalled();
+    expect(r.observation).toContain("in your current tab 7 (no new tab)");
+    expect(r.observation).toMatch(/no longer valid; call read_page/);
+  });
+
+  it("activates the bound tab (tab-level only) when it is in the background", async () => {
+    setTab(false);
+    const r = await openUrlTool.handler({ url: "https://classroom.google.com/u/1/c/abc" }, ctx);
+    expect(r.success).toBe(true);
+    expect(tabsMock().update).toHaveBeenNthCalledWith(1, 7, { url: "https://classroom.google.com/u/1/c/abc" });
+    expect(tabsMock().update).toHaveBeenNthCalledWith(2, 7, { active: true });
+    expect(windowsUpdate).not.toHaveBeenCalled();
+  });
+
+  it("resolves relative URLs against the bound tab's current URL", async () => {
+    await openUrlTool.handler({ url: "/u/1/c/abc" }, ctx);
+    expect(tabsMock().update).toHaveBeenLastCalledWith(7, { url: "https://classroom.google.com/u/1/c/abc" });
+    await openUrlTool.handler({ url: "c/abc?x=1" }, ctx);
+    // Base is now .../u/1/c/abc → sibling "c/abc" resolves under /u/1/c/.
+    expect(tabsMock().update).toHaveBeenLastCalledWith(7, { url: "https://classroom.google.com/u/1/c/c/abc?x=1" });
+    expect(tabsMock().create).not.toHaveBeenCalled();
+  });
+
+  it("rejects non-http(s) schemes after resolving", async () => {
+    for (const url of ["javascript:alert(1)", "chrome://settings", "data:text/html,x", "file:///etc/passwd"]) {
+      const r = await openUrlTool.handler({ url }, ctx);
+      expect(r.success).toBe(false);
+      expect(r.error).toMatch(/unsafe-url-scheme/);
+    }
+    // A chrome:// bound tab makes relative paths resolve to chrome:// → rejected.
+    chromeMock.tabs.__tabsById.set(7, { id: 7, url: "chrome://newtab/", active: true } as never);
+    const r = await openUrlTool.handler({ url: "/c/abc" }, ctx);
+    expect(r.success).toBe(false);
+    expect(r.error).toMatch(/unsafe-url-scheme "chrome:"/);
+    expect(tabsMock().update).not.toHaveBeenCalled();
+    expect(tabsMock().create).not.toHaveBeenCalled();
+  });
+
+  it("invalidates the bound tab's page atlas", async () => {
+    const { pageAtlasStore } = await import("./page-atlas/state");
+    const spy = vi.spyOn(pageAtlasStore, "invalidateTab");
+    await openUrlTool.handler({ url: "https://classroom.google.com/x" }, ctx);
+    expect(spy).toHaveBeenCalledWith(7);
+    spy.mockRestore();
+  });
+
+  it("falls back to creating a tab when there is no current tab (sentinel tabId)", async () => {
+    tabsMock().create.mockResolvedValue({ id: 50, url: "about:blank" });
+    chromeMock.tabs.__tabsById.set(50, { id: 50, url: "https://example.com/" });
+    const p = openUrlTool.handler({ url: "https://example.com/" }, { tabId: -1 } as never);
+    await new Promise((r) => setTimeout(r, 0));
+    fireCommit(50);
+    const r = await p;
+    expect(r.success).toBe(true);
+    expect(tabsMock().create).toHaveBeenCalledWith({ url: "https://example.com/", active: true });
+    expect(tabsMock().update).not.toHaveBeenCalled();
+    expect(windowsUpdate).not.toHaveBeenCalled();
+  });
+
+  it("advertises new_tab and drops the old `active` param", () => {
+    const props = (openUrlTool.parameters as { properties: Record<string, unknown> }).properties;
+    expect(props).toHaveProperty("new_tab");
+    expect(props).not.toHaveProperty("active");
   });
 });

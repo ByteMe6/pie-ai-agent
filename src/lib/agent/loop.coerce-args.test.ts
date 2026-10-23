@@ -167,14 +167,19 @@ vi.mock("./wait-for-url-settle", () => ({
 vi.mock("./text-tool-invocation", () => ({
   parseTextToolInvocations: vi.fn(() => []),
 }));
+const { streamChatArgs } = vi.hoisted(() => ({ streamChatArgs: [] as unknown[][] }));
 vi.mock("../model-router", () => ({
-  streamChat: (...args: unknown[]) => streamChatImpl.current(...(args as [])),
+  streamChat: (...args: unknown[]) => {
+    streamChatArgs.push(args);
+    return streamChatImpl.current(...(args as []));
+  },
 }));
 
 describe("runAgentLoop tool-arg coercion", () => {
   beforeEach(() => {
     vi.clearAllMocks();
     probeHandler.mockClear();
+    streamChatArgs.length = 0;
   });
 
   it("handler receives numeric tabId when the model sent an exponent string", async () => {
@@ -269,8 +274,23 @@ describe("runAgentLoop tool-arg coercion", () => {
     expect(probeHandler.mock.calls[0][0]).toEqual({ tabId: 3 });
   });
 
-  it("does not invent a tabId for tools that require one", async () => {
-    await runOne("probe_tab", '{"verbose":true}');
-    expect(probeHandler.mock.calls[0][0]).toEqual({ verbose: true });
+  it("fills a left-out tabId even when the tool's schema requires it", async () => {
+    const emitted = await runOne("probe_tab", '{"verbose":true}');
+    expect(probeHandler.mock.calls[0][0]).toEqual({ verbose: true, tabId: 7 });
+    const step = emitted.find((m) => m.type === "agent-step" && m.tool === "probe_tab");
+    expect(step?.args).toEqual({ verbose: true, tabId: 7 });
+  });
+
+  it("replaces a non-numeric tabId with the task's current tab", async () => {
+    await runOne("probe_tab", '{"tabId":"current"}');
+    expect(probeHandler.mock.calls[0][0]).toEqual({ tabId: 7 });
+  });
+
+  it("offers tabId as optional on the wire", async () => {
+    await runOne("probe_tab", '{"tabId":7}');
+    const defs = streamChatArgs[0][3] as Array<{ name: string; parameters: { required?: string[]; properties: { tabId: { description?: string } } } }>;
+    const probe = defs.find((d) => d.name === "probe_tab")!;
+    expect(probe.parameters.required ?? []).not.toContain("tabId");
+    expect(probe.parameters.properties.tabId.description).toMatch(/Leave out for the current tab/);
   });
 });
