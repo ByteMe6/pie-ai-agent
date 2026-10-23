@@ -864,7 +864,9 @@ describe("read_page tool", () => {
     // 20 on-screen (80..99) + the first 5 off-screen, listed in document order.
     expect(idxs).toEqual([0, 1, 2, 3, 4, ...Array.from({ length: 20 }, (_, i) => 80 + i)]);
     expect(r.observation).toContain("75 more elements not shown");
-    expect(r.observation).toContain("max_elements");
+    // Footer names only advertised args (query), never the hidden max_elements.
+    expect(r.observation).toContain('query:"');
+    expect(r.observation).not.toContain("max_elements");
 
     const clamped = await readPageTool.handler({ tabId: 7, mode: "interactive", max_elements: 1 }, {} as any);
     expect(clamped.observation!.match(/<interactive_element /g)).toHaveLength(10);
@@ -1264,10 +1266,62 @@ describe("read_page mode=text", () => {
     expect((await readPageTool.handler({ tabId: 7, mode: "text" }, {} as never)).error).toBe("discardedTabRequiresActivation");
   });
 
-  it("advertises text in the mode enum", () => {
-    const props = (readPageTool.parameters as any).properties;
-    expect(props.mode.enum).toContain("text");
-    expect(props.max_chars).toBeDefined();
-    expect(readPageTool.description).toMatch(/mode=text/);
+  it("advertises only tabId/mode/query/offset, mode text|interactive|atlas, tabId optional", () => {
+    const params = readPageTool.parameters as any;
+    expect(Object.keys(params.properties).sort()).toEqual(["mode", "offset", "query", "tabId"]);
+    expect(params.properties.mode.enum).toEqual(["text", "interactive", "atlas"]);
+    expect(params.required ?? []).not.toContain("tabId");
+    // Old callers sending hidden args (max_chars, scope, …) must not be rejected.
+    expect(params.additionalProperties).not.toBe(false);
+    for (const hidden of ["max_chars", "max_elements", "max_bytes", "scope", "html", "full", "content"]) {
+      expect(readPageTool.description).not.toContain(hidden);
+    }
+    expect(readPageTool.description).toContain("query");
+    expect(readPageTool.description).toContain('mode:"interactive"');
+    expect(readPageTool.description.split(/(?<=\.)\s/).length).toBeLessThanOrEqual(4);
+  });
+
+  it("reads the task's current tab (ctx.tabId) when tabId is omitted or unusable", async () => {
+    document.body.innerHTML = "<p>current tab body</p>";
+    stubTextChrome({ url: location.href });
+    const r = await readPageTool.handler({}, { tabId: 7 } as never);
+    expect(r.success).toBe(true);
+    expect(r.observation).toMatch(/^Tab: 7\n/);
+    expect(r.observation).toContain("current tab body");
+    expect((chrome.tabs.get as any)).toHaveBeenCalledWith(7);
+    __resetReadPageMemo();
+    const s = await readPageTool.handler({ tabId: "current" }, { tabId: 7 } as never);
+    expect(s.success).toBe(true);
+    expect(s.observation).toContain("current tab body");
+    const none = await readPageTool.handler({}, {} as never);
+    expect(none.success).toBe(false);
+    expect(none.error).toMatch(/no tabId/);
+  });
+
+  it("still honours hidden legacy args (scope, max_chars) when sent", async () => {
+    document.body.innerHTML = `<nav><a href="/x">Navlink</a></nav><main>${paragraphs(20)}</main>`;
+    stubTextChrome({ url: location.href });
+    const main = await readPageTool.handler({ tabId: 7 }, {} as never);
+    expect(main.observation).not.toContain("Navlink");
+    __resetReadPageMemo();
+    const page = await readPageTool.handler({ tabId: 7, scope: "page" }, {} as never);
+    expect(page.observation).toContain("Navlink");
+  });
+
+  it("text footers reference only advertised args", async () => {
+    document.body.innerHTML = `<nav>menu</nav><main>${paragraphs(1000)}</main>`;
+    stubTextChrome({ url: location.href });
+    const hidden = /max_chars|max_elements|max_bytes|scope|search_page|mode:"atlas"|mode=\\?"atlas/;
+    const obs = [
+      (await readPageTool.handler({ tabId: 7 }, {} as never)).observation!,
+      (await readPageTool.handler({ tabId: 7, query: "Paragraph 1" }, {} as never)).observation!,
+      (await readPageTool.handler({ tabId: 7, query: "zzz" }, {} as never)).observation!,
+      (await readPageTool.handler({ tabId: 7, offset: 10_000_000 }, {} as never)).observation!,
+    ];
+    for (const o of obs) {
+      const footer = o.split("</untrusted_page_content>")[1];
+      expect(footer).not.toMatch(hidden);
+    }
+    expect(obs[0]).toContain("offset:");
   });
 });

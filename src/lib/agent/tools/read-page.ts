@@ -15,12 +15,19 @@ import { extractPageTextInjected, type PageTextResult } from "../../dom-actions/
 // (qwen via Ollama) drowned in the old 300–500 KB raw-HTML budgets; strong
 // models never needed them (atlas + read_target/find_target cover structure).
 //
+// The ADVERTISED schema is deliberately tiny — tabId (optional, defaults to
+// the task's current tab), mode text|interactive|atlas, query, offset — and
+// every footer only names those. The handler still honours the older surface
+// for back-compat (old transcripts, skills, strong models):
+//
 //   text (default)  readable text, paged by `offset`, filtered by `query`
-//   atlas           compact Page Atlas (capped by render.ts)
-//   interactive     element index, capped at `max_elements`
-//   full            text (first page) + capped interactive index
-//   html            raw markup, hard cap HTML_MAX_BYTES — last resort
-//   auto / content  aliases of text (back-compat)
+//   interactive     element index, capped at `max_elements` (hidden arg)
+//   atlas           compact Page Atlas (capped by render.ts) — advertised only
+//                   because find_target/read_struct/read_target need its ids
+//   full            hidden: text (first page) + capped interactive index
+//   html            hidden: raw markup, hard cap HTML_MAX_BYTES — last resort
+//   auto / content  hidden aliases of text
+//   max_chars / max_bytes / scope / max_elements   hidden, still honoured
 
 /** mode="html" hard byte cap (and default). */
 export const HTML_MAX_BYTES = 30_000;
@@ -79,7 +86,7 @@ function resolveHtmlBudget(rawMaxBytes: unknown): number {
 type ReadPageMode = "text" | "atlas" | "interactive" | "full" | "html";
 
 interface ReadPageArgs {
-  tabId: number;
+  tabId?: number;
   mode?: string;
   max_bytes?: number;
   max_chars?: number;
@@ -335,7 +342,7 @@ async function readTextSection(tabId: number, args: TextReadArgs): Promise<TextR
   const diagInfo: Record<string, unknown> = { totalChars: total, capped, root: data.root, maxChars: args.maxChars, offset: args.offset };
 
   if (total === 0) {
-    body = "(no readable text found — the page may still be loading, or its content is in an iframe/canvas; try mode=\"interactive\" or mode=\"atlas\")";
+    body = "(no readable text found — the page may still be loading, or its content is in an iframe/canvas; try mode=\"interactive\")";
   } else if (args.terms.length > 0) {
     attrs.push(attr("query", args.rawQuery));
     const q = renderTextQuery(full, args.terms, args.offset, args.maxChars);
@@ -377,10 +384,10 @@ async function readTextSection(tabId: number, args: TextReadArgs): Promise<TextR
     }
   }
   if (capped && (args.terms.length > 0 || slicePageText(full, args.offset, args.maxChars).next === null)) {
-    footer.push(`(The page is very long; text beyond ${total} chars was not extracted. Use search_page for text further down.)`);
+    footer.push(`(The page is very long; only its first ${total} chars of text could be read.)`);
   }
   if (data.root === "main" && args.scope === "main") {
-    footer.push(`(Showing the page's main content area only; pass scope="page" to include navigation and sidebars.)`);
+    footer.push(`(Showing the page's main content only; menus and sidebars are left out — their links and buttons are listed by mode:"interactive".)`);
   }
   const wrapper = [`<untrusted_page_content ${attrs.join(" ")}>`, escapeUntrustedWrappers(body), "</untrusted_page_content>"];
   return { ok: true, data, wrapper, footer, diagInfo };
@@ -526,8 +533,7 @@ export function renderInteractiveIndex(
   if (hidden > 0) {
     footer.push(
       `${hidden} more element${hidden === 1 ? "" : "s"} not shown (on-screen and text fields listed first) — ` +
-        `use query="…" to filter by name/text/href (alternatives separated by |, e.g. query:"submit|send"), ` +
-        `or max_elements (up to ${INTERACTIVE_MAX_MAX}).`,
+        `use query:"…" to list only elements whose name/text/link matches (alternatives separated by |, e.g. query:"submit|send").`,
     );
   }
   if (opts.terms.length > 0 && matched.length === 0) {
@@ -597,66 +603,44 @@ function sliceUtf8(value: string, maxBytes: number): string {
 
 export const readPageTool: Tool = {
   name: "read_page",
+  // Kept plain on purpose (weak local models): only the advertised args
+  // appear here. Hidden legacy args are documented at the top of the file.
   description:
-    "Inspect the given tab. Every result is size-bounded. " +
-    "Default (mode=text): the page's readable text as light markdown (headings, lists, links as [text](url)), " +
-    `${TEXT_MAX_CHARS_DEFAULT} chars per call — page through long pages with offset, or pass query to get only matching lines. ` +
-    "mode=interactive: element indices for click/type/select (capped; filter with query). " +
-    "mode=atlas: compact Page Atlas of targets/controls for structured extraction (read_struct / read_target / find_target). " +
-    "mode=full: text + interactive index together. mode=html: raw markup, last resort only.",
+    `Read the current page as plain text, about ${TEXT_MAX_CHARS_DEFAULT} characters per call; a long page ends with a "Next:" line — call it with that offset to read on. ` +
+    "Use query to get only the lines containing some words (e.g. query:\"§|homework\"). " +
+    "Use mode:\"interactive\" to get numbered elements, needed before click/type/select.",
   parameters: {
     type: "object",
     properties: {
-      tabId: { type: "integer", description: "Tab id to read." },
+      tabId: { type: "integer", description: "Tab to read. Leave out to read the current tab." },
       mode: {
         type: "string",
-        enum: ["text", "atlas", "interactive", "full", "html", "auto", "content"],
+        enum: ["text", "interactive", "atlas"],
         description:
-          "text (default): readable page text — use this to read content. interactive: element indices only, no body text — use before clicking/typing. " +
-          "atlas: compact page atlas (target ids for read_struct/read_target). full: text plus interactive index. " +
-          `html: raw HTML capped at ${HTML_MAX_BYTES} bytes — last resort when text/atlas cannot show what you need. auto and content are aliases of text.`,
+          "text (default): the page as plain text. " +
+          "interactive: clickable elements with index numbers, needed before click/type/select. " +
+          "atlas: ids of tables and lists, only for find_target / read_struct / read_target / extract_records.",
+      },
+      query: {
+        type: "string",
+        description: "Words to find, separate alternatives with | (e.g. \"§|homework\"). Returns only the matching lines (or, with mode interactive, matching elements).",
       },
       offset: {
         type: "integer",
         minimum: 0,
-        description: "mode=text: start at this character offset (from the previous result's \"Next:\" hint) to read the next part of a long page.",
-      },
-      query: {
-        type: "string",
-        description:
-          "mode=text: return only lines containing any of these words (case-insensitive; separate alternatives with |, e.g. \"§|chapter|read\"), each with a line of context. " +
-          "mode=interactive/full: list only elements whose name/text/href/role matches.",
-      },
-      max_chars: {
-        type: "integer",
-        minimum: TEXT_MAX_CHARS_MIN,
-        maximum: TEXT_MAX_CHARS_MAX,
-        description: `mode=text: characters per call (default ${TEXT_MAX_CHARS_DEFAULT}). Prefer offset paging or query over raising this.`,
-      },
-      max_elements: {
-        type: "integer",
-        minimum: INTERACTIVE_MAX_MIN,
-        maximum: INTERACTIVE_MAX_MAX,
-        description: `mode=interactive/full: max elements listed (default ${INTERACTIVE_MAX_DEFAULT}); on-screen elements come first.`,
-      },
-      scope: {
-        type: "string",
-        enum: ["main", "page"],
-        description: "mode=text: main (default) reads the page's main content area when it has one; page reads the whole page including navigation and sidebars.",
-      },
-      max_bytes: {
-        type: "integer",
-        minimum: 1,
-        description: `Legacy size hint: mode=html byte budget (max ${HTML_MAX_BYTES}); for mode=text it is treated as max_chars.`,
+        description: "Where to start reading — the number from the previous result's \"Next:\" line.",
       },
     },
-    required: ["tabId"],
-    additionalProperties: false,
   },
-  handler: async (args: unknown, _ctx: ToolHandlerContext): Promise<ActionResult> => {
+  handler: async (args: unknown, ctx: ToolHandlerContext): Promise<ActionResult> => {
     const a = (args ?? {}) as ReadPageArgs;
-    if (typeof a.tabId !== "number") {
-      return { success: false, error: "read_page requires a numeric tabId" };
+    // tabId is optional: a missing (or unusable, e.g. "current") tabId reads
+    // the task's current tab — ctx.tabId is the loop's live focused pin.
+    // read_page is read-class, so the R7 cross-session lock never inspects
+    // its args; nothing upstream needs an explicit tabId.
+    const tabId = typeof a.tabId === "number" && Number.isFinite(a.tabId) ? a.tabId : ctx?.tabId;
+    if (typeof tabId !== "number") {
+      return { success: false, error: "read_page: no tabId given and no current tab to read" };
     }
     const mode = normalizeMode(a.mode);
     if (a.mode === "content" || (a.mode !== undefined && a.mode !== mode && a.mode !== "auto")) {
@@ -673,11 +657,11 @@ export const readPageTool: Tool = {
 
     let tab: chrome.tabs.Tab;
     try {
-      tab = await chrome.tabs.get(a.tabId);
+      tab = await chrome.tabs.get(tabId);
     } catch {
       return { success: false, error: "Tab not found" };
     }
-    if (await isPdfTabAsync(a.tabId, tab.url)) {
+    if (await isPdfTabAsync(tabId, tab.url)) {
       return {
         success: false,
         error:
@@ -697,21 +681,21 @@ export const readPageTool: Tool = {
     const memoSig = [tab.url ?? "", mode, offset, rawQuery, scope, maxChars, maxElements, totalBudgetBytes].join("\u0000");
     const withMemo = (r: ActionResult): ActionResult =>
       r.success && typeof r.observation === "string"
-        ? { ...r, observation: applyUnchangedMemo(a.tabId, memoSig, r.observation) }
+        ? { ...r, observation: applyUnchangedMemo(tabId, memoSig, r.observation) }
         : r;
 
     if (mode === "text") {
-      return withMemo(await readPageText(a.tabId, tab, textArgs));
+      return withMemo(await readPageText(tabId, tab, textArgs));
     }
 
     if (mode === "atlas") {
-      lastReadByTab.delete(a.tabId);
+      lastReadByTab.delete(tabId);
       // Per-frame fan-out (see inject-all-frames.ts): a zombie frame with an
       // interrupted navigation must cost only its own timeout budget instead
       // of hanging the whole read.
       let injection: AllFramesInjectionOutcome<ProbeResult>;
       try {
-        injection = await executeScriptAllFrames<ProbeResult>(a.tabId, probePageInjected, [
+        injection = await executeScriptAllFrames<ProbeResult>(tabId, probePageInjected, [
           { op: "atlas" },
         ]);
       } catch (e) {
@@ -735,7 +719,7 @@ export const readPageTool: Tool = {
       const atlasId = `atlas_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`;
       const atlas: PageAtlasState = {
         atlasId,
-        tabId: a.tabId,
+        tabId,
         url: topUrl,
         origin: parseOrigin(topUrl),
         // The document's own title (fingerprint) beats tab metadata, which can
@@ -802,7 +786,7 @@ export const readPageTool: Tool = {
     // wedge the snapshot read.
     let snapshotInjection: AllFramesInjectionOutcome<ProbeResult>;
     try {
-      snapshotInjection = await executeScriptAllFrames<ProbeResult>(a.tabId, probePageInjected, [
+      snapshotInjection = await executeScriptAllFrames<ProbeResult>(tabId, probePageInjected, [
         { op: "snapshot" },
       ]);
     } catch (e) {
@@ -943,7 +927,7 @@ export const readPageTool: Tool = {
     const docInfo = topSnapshot?.op === "snapshot" ? topSnapshot : undefined;
     const headerLines = [
       ...pageHeaderLines({
-        tabId: a.tabId,
+        tabId,
         url: docInfo?.url || topUrl,
         title: docInfo?.title ?? tab.title ?? "",
         tabUrl: tab.url ?? "",
@@ -973,7 +957,7 @@ export const readPageTool: Tool = {
     if (mode === "full") {
       // full = the capped index + the text surface (first page, or query
       // hits — the same query narrows both).
-      const text = await readTextSection(a.tabId, textArgs);
+      const text = await readTextSection(tabId, textArgs);
       observationParts.push(
         text.ok ? [...text.wrapper, ...text.footer].join("\n") : `(page text unavailable: ${text.error})`,
       );
