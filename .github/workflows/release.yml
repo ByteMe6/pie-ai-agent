@@ -325,6 +325,68 @@ jobs:
               "https://github.com/${{ github.repository }}/releases/download/${{ steps.tag.outputs.ref }}/$asset"
           done
 
+  # Linux：非官方产物。daemon 在 Linux 上可用 unix socket + bubblewrap sandbox，
+  # 但没有安装器、launchd 自动启动和 self-update；这里只编译独立二进制，
+  # 供手动运行（pie daemon / pie doctor）。不打进 pie-link-latest.json。
+  build-daemon-linux:
+    runs-on: ubuntu-latest
+    needs: daemon-version-gate
+    steps:
+      - name: Resolve tag
+        id: tag
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            TAG="${{ inputs.tag }}"
+          else
+            TAG="${GITHUB_REF_NAME}"
+          fi
+          echo "ref=${TAG}" >> "$GITHUB_OUTPUT"
+
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ steps.tag.outputs.ref }}
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@v2
+
+      - name: Read daemon version
+        id: dv
+        run: echo "version=$(jq -r .version daemon/package.json)" >> "$GITHUB_OUTPUT"
+
+      - name: Compile Linux binaries
+        working-directory: daemon
+        env:
+          VER: ${{ steps.dv.outputs.version }}
+        run: |
+          bun install --frozen-lockfile
+          mkdir -p dist
+          bun build ./src/cli.ts --compile --target=bun-linux-x64 \
+            --define "process.env.PIE_DAEMON_VERSION=\"$VER\"" \
+            --outfile dist/pie-linux-x64
+          bun build ./src/cli.ts --compile --target=bun-linux-arm64 \
+            --define "process.env.PIE_DAEMON_VERSION=\"$VER\"" \
+            --outfile dist/pie-linux-arm64
+          chmod +x dist/pie-linux-x64 dist/pie-linux-arm64
+          file dist/pie-linux-x64 dist/pie-linux-arm64
+
+      - name: Upload binaries to release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release upload "${{ steps.tag.outputs.ref }}" \
+            daemon/dist/pie-linux-x64 \
+            daemon/dist/pie-linux-arm64 \
+            --clobber
+
+      - name: Verify assets reachable
+        run: |
+          sleep 5
+          for asset in pie-linux-x64 pie-linux-arm64; do
+            curl -fsSIL -o /dev/null --retry 3 --retry-delay 5 --retry-all-errors \
+              "https://github.com/${{ github.repository }}/releases/download/${{ steps.tag.outputs.ref }}/$asset"
+          done
+
   # #403 自更新 appcast：汇总 mac + win 两 job 的版本号与 sha256，生成固定名 pie-link-latest.json。
   # daemon checkUpdate / 托盘检查更新 / 扩展升级卡都从 /releases/latest/download/pie-link-latest.json 读它。
   daemon-latest-json:
